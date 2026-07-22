@@ -124,6 +124,17 @@ def _reload_with_retry(
     if last_exc is not None:
         raise last_exc
 
+
+def _new_page_for_registration(browser):
+    try:
+        return browser.new_page()
+    except Exception as exc:
+        message = str(exc)
+        if "Browser.setDefaultViewport" not in message or "isMobile" not in message:
+            raise
+        context = browser.new_context(no_viewport=True)
+        return context.new_page()
+
 EMAIL_INPUT_SELECTORS = [
     'input#login-email',
     'input[type="email"]',
@@ -2670,7 +2681,7 @@ class ChatGPTBrowserRegister:
                 launch_opts["geoip"] = True
 
         with self._open_browser(launch_opts) as browser:
-            page = browser.new_page()
+            page = _new_page_for_registration(browser)
             self.log("启动浏览器上下文注册状态机")
             final_state = _browser_registration_flow(
                 page,
