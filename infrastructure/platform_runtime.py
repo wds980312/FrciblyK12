@@ -41,6 +41,7 @@ PERSISTED_ACTION_DATA_KEYS = {
     "orgId",
     "auth_token",
     "authToken",
+    "workspace_join",
 }
 
 STATEFUL_ACTION_IDS = {"get_account_state", "switch_account", "query_state", "switch_desktop"}

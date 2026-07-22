@@ -1780,6 +1780,15 @@ def _fetch_chatgpt_session_via_same_origin(page, cookies_dict: dict, log, sessio
     return None, f"session API HTTP {status}: {text[:200]}", True
 
 
+def _is_playwright_driver_disconnected(message: str) -> bool:
+    lowered = str(message or "").lower()
+    return (
+        "connection closed while reading from the driver" in lowered
+        or "target page, context or browser has been closed" in lowered
+        or "browser has been closed" in lowered
+    )
+
+
 def _fetch_chatgpt_session_from_page(page, cookies_dict: dict, log, timeout: int = 45) -> dict:
     deadline = time.time() + max(int(timeout or 0), 5)
     last_error = ""
@@ -1798,6 +1807,8 @@ def _fetch_chatgpt_session_from_page(page, cookies_dict: dict, log, timeout: int
         if same_origin_attempted and same_origin_error:
             last_error = same_origin_error
             log(f"ChatGPT session API 浏览器内请求暂未拿到 token: {last_error}")
+            if _is_playwright_driver_disconnected(last_error):
+                raise RuntimeError(f"ChatGPT session 浏览器驱动已断开: {last_error}")
             if "object has no attribute 'evaluate'" not in last_error:
                 time.sleep(2)
                 continue
@@ -1827,6 +1838,8 @@ def _fetch_chatgpt_session_from_page(page, cookies_dict: dict, log, timeout: int
         except Exception as exc:
             last_error = str(exc)
             log(f"ChatGPT session API 打开异常: {last_error}")
+            if _is_playwright_driver_disconnected(last_error):
+                raise RuntimeError(f"ChatGPT session 浏览器驱动已断开: {last_error}")
         time.sleep(2)
 
     raise RuntimeError(f"ChatGPT session 未返回 accessToken: {last_error}")
@@ -2258,7 +2271,14 @@ def _follow_redirects_for_code(session, start_url: str, log, *, max_redirects: i
     return ""
 
 
-def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | None, log) -> dict | None:
+def _complete_oauth_with_session(
+    cookies_dict: dict,
+    oauth_start,
+    proxy: str | None,
+    log,
+    *,
+    target_workspace_id: str = "",
+) -> dict | None:
     from .oauth import submit_callback_url
     from curl_cffi import requests as cffi_requests
 
@@ -2277,7 +2297,26 @@ def _complete_oauth_with_session(cookies_dict: dict, oauth_start, proxy: str | N
         if not workspaces:
             log("  ⚠️ 缺少 oai-client-auth-session workspaces，OAuth 失败")
             return None
-        workspace_id = str((workspaces[0] or {}).get("id") or "").strip()
+        target_workspace_id = str(target_workspace_id or "").strip()
+        workspace = None
+        if target_workspace_id:
+            workspace = next(
+                (
+                    item
+                    for item in workspaces
+                    if str((item or {}).get("id") or "").strip() == target_workspace_id
+                ),
+                None,
+            )
+            if workspace is None:
+                log(
+                    "  ⚠️ OAuth consent workspaces 中没有目标 workspace: "
+                    f"{target_workspace_id[:8]}"
+                )
+                return None
+        else:
+            workspace = workspaces[0] if workspaces else None
+        workspace_id = str((workspace or {}).get("id") or "").strip()
         log(f"  选择 workspace: {workspace_id}")
         ws_resp = s.post(
             "https://auth.openai.com/api/accounts/workspace/select",
@@ -2544,6 +2583,7 @@ def _do_codex_oauth(
     *,
     allow_add_phone_retry: bool = True,
     oauth_start=None,
+    target_workspace_id: str = "",
 ) -> dict | None:
     """在真实浏览器会话内完成 Codex OAuth，返回完整 token 包。
 
@@ -2649,13 +2689,20 @@ def _do_codex_oauth(
                 continue
 
             if state["page_type"] in {"consent", "workspace_selection", "organization_selection", "external_url"}:
-                browser_result = _complete_oauth_in_browser(page, oauth_start, proxy, log)
-                if browser_result:
-                    return browser_result
                 cookies_dict = _get_cookies(page)
-                session_result = _complete_oauth_with_session(cookies_dict, oauth_start, proxy, log)
+                session_result = _complete_oauth_with_session(
+                    cookies_dict,
+                    oauth_start,
+                    proxy,
+                    log,
+                    target_workspace_id=target_workspace_id,
+                )
                 if session_result:
                     return session_result
+                if not str(target_workspace_id or "").strip():
+                    browser_result = _complete_oauth_in_browser(page, oauth_start, proxy, log)
+                    if browser_result:
+                        return browser_result
                 log("  ⚠️ 页面已到 consent/workspace，但会话补全失败")
                 return None
 
@@ -2838,7 +2885,12 @@ def _handle_post_signup_onboarding(page, log) -> None:
     if "chatgpt.com" not in current_url:
         return
     try:
-        # 可能弹出 persistent storage 提示，优先点 Allow，不影响主流程也可点 Block。
+        page.context.grant_permissions(["persistent-storage"], origin=CHATGPT_APP)
+        log("已预授权 ChatGPT persistent storage 权限")
+    except Exception:
+        pass
+    try:
+        # 可能弹出页面内权限提示，优先点允许；浏览器原生权限条由 grant_permissions 兜底。
         allow_selector = _click_first(
             page,
             [
@@ -2854,6 +2906,36 @@ def _handle_post_signup_onboarding(page, log) -> None:
         )
         if allow_selector:
             log(f"已处理浏览器弹窗: {allow_selector}")
+    except Exception:
+        pass
+
+    try:
+        data = page.evaluate(
+            """
+            () => {
+              const textOf = (el) => String(
+                el && (el.innerText || el.textContent || el.getAttribute("aria-label")) || ""
+              ).replace(/\\s+/g, " ").trim();
+              const normalized = (value) => String(value || "").replace(/[’‘`]/g, "'").replace(/\\s+/g, " ").trim();
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+              };
+              const dismissPattern = /^(Continue|Okay,? let's go|Got it|Skip|Next|Done|继续|好的|知道了|跳过|下一步|完成)$/i;
+              const buttons = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+              const target = buttons.find((button) => dismissPattern.test(normalized(textOf(button))));
+              if (!target) return { ok: false };
+              try { target.scrollIntoView({ block: "center", inline: "center" }); } catch (_) {}
+              target.click();
+              return { ok: true, text: textOf(target) };
+            }
+            """
+        )
+        if isinstance(data, dict) and data.get("ok"):
+            log(f"已处理 ChatGPT 初始确认页: {data.get('text') or '-'}")
+            _browser_pause(page)
     except Exception:
         pass
 
@@ -4194,7 +4276,10 @@ def _submit_about_you_via_page(page, log) -> dict:
               const hasBirthday = allText.some((t) =>
                 t.includes('birthday') || t.includes('date of birth') || t.includes('birth') || t.includes('生日') || t.includes('出生') || t.includes('生年月日') || t.includes('誕生日') || t.includes('fecha de nacimiento') || t.includes('nascimento') || t.includes('geburtstag') || t.includes('naissance')
               );
-              return { labels, placeholders, headings, hasAge, hasBirthday };
+              const hasBirthYear = allText.some((t) =>
+                t.includes('year of birth') || t.includes('birth year') || t.includes('出生年份') || t.includes('生年')
+              );
+              return { labels, placeholders, headings, hasAge, hasBirthday, hasBirthYear };
             }
             """
         ) or {}
@@ -4203,6 +4288,7 @@ def _submit_about_you_via_page(page, log) -> dict:
 
     has_age_label = bool(mode_probe.get("hasAge"))
     has_birthday_label = bool(mode_probe.get("hasBirthday"))
+    has_birth_year_label = bool(mode_probe.get("hasBirthYear"))
     has_age_field = any(_has_visible(candidate) for candidate in age_candidates[:3])
     has_birthday_field = any(_has_visible(candidate) for candidate in birthday_candidates[:3])
     has_birthday_select = False
@@ -4212,6 +4298,8 @@ def _submit_about_you_via_page(page, log) -> dict:
         has_birthday_select = False
     if has_birthday_select:
         about_mode = "birthday_select"
+    elif has_birth_year_label:
+        about_mode = "birth_year"
     elif (has_age_label and not has_birthday_label) or (has_age_field and not has_birthday_field):
         about_mode = "age"
     else:
@@ -4248,6 +4336,8 @@ def _submit_about_you_via_page(page, log) -> dict:
             "about_you age 直接定位: "
             f"name={direct_name_selector or '-'}, age={direct_age_selector or '-'}"
         )
+    if about_mode == "birth_year":
+        log("about_you year-of-birth 模式: 只填写出生年份")
 
     def _fill_segmented_date(mm: str, dd: str, yyyy: str) -> bool:
         """处理 MM / DD / YYYY 分段日期输入框（React DateField 样式）。
@@ -4331,6 +4421,17 @@ def _submit_about_you_via_page(page, log) -> dict:
             fill_result["day"] = True
             fill_result["year"] = True
             fill_result["birthdate"] = True
+    elif about_mode == "birth_year":
+        birth_year_value = yyyy if len(date_parts) == 3 else birthdate[:4]
+        if direct_age_selector and _fill_input_like_user(page, direct_age_selector, birth_year_value):
+            fill_result["year"] = True
+            fill_result["birthdate"] = True
+        elif _fill_visible_input_entry(age_entry, birth_year_value):
+            fill_result["year"] = True
+            fill_result["birthdate"] = True
+        elif _fill_second_visible_input([birth_year_value], excluded_visible_indices={int(name_entry.get("visibleIndex"))} if name_entry and str(name_entry.get("visibleIndex", "")).isdigit() else set()):
+            fill_result["year"] = True
+            fill_result["birthdate"] = True
     elif about_mode == "age":
         if direct_name_selector and _fill_input_like_user(page, direct_name_selector, name):
             fill_result["name"] = True
@@ -4400,6 +4501,7 @@ def _submit_about_you_via_page(page, log) -> dict:
     if not (
         fill_result.get("birthdate")
         or fill_result.get("age")
+        or (about_mode == "birth_year" and fill_result.get("year"))
         or (fill_result.get("month") and fill_result.get("day") and fill_result.get("year"))
     ):
         raise RuntimeError("about_you 未成功填写 Birthday/Age")
@@ -4504,6 +4606,34 @@ def _submit_about_you_via_page(page, log) -> dict:
                 )
                 if retry_submit_selector:
                     log(f"about_you 重试提交按钮: {retry_submit_selector}")
+                    time.sleep(0.5)
+                    continue
+            if (
+                about_mode == "birth_year"
+                and not retried_generic_validation
+                and "valid year of birth" in normalized_error
+            ):
+                retried_generic_validation = True
+                birth_year_value = yyyy if len(date_parts) == 3 else birthdate[:4]
+                log("about_you year-of-birth 被拒，重新填写年份后重试一次...")
+                excluded_indices = {int(name_entry.get("visibleIndex"))} if name_entry and str(name_entry.get("visibleIndex", "")).isdigit() else set()
+                _fill_second_visible_input([birth_year_value], excluded_visible_indices=excluded_indices)
+                retry_submit_selector = _click_first(
+                    page,
+                    [
+                        'button:has-text("Finish creating account")',
+                        'button:has-text("finish creating account")',
+                        'button[type="submit"]',
+                        'button[data-testid="continue-button"]',
+                        'button:has-text("Continue")',
+                        'button:has-text("continue")',
+                        'button:has-text("Next")',
+                        'button:has-text("next")',
+                    ],
+                    timeout=5,
+                )
+                if retry_submit_selector:
+                    log(f"about_you year-of-birth 重试提交按钮: {retry_submit_selector}")
                     time.sleep(0.5)
                     continue
             return {"ok": False, "status": 400, "url": current_url, "data": None, "text": error_text}
@@ -4675,6 +4805,7 @@ class ChatGPTBrowserRegister:
         log_fn: Callable[[str], None] = print,
         backend_config: Optional[BrowserBackendConfig] = None,
         post_register_in_browser: Optional[Callable[[Any, dict], dict]] = None,
+        early_save_result: Optional[Callable[[dict], None]] = None,
     ):
         self.headless = headless
         self.proxy = proxy
@@ -4687,6 +4818,7 @@ class ChatGPTBrowserRegister:
         # 合并进 run() 的结果（如 {"midtrans_url": "..."}）。回调异常不影响
         # 注册结果本身（只记日志、不抛）。
         self.post_register_in_browser = post_register_in_browser
+        self.early_save_result = early_save_result
         # backend_config 为 None 时默认 Camoufox，跟老调用方一致。
         # BitBrowser 路径需要上层 plugin.py 显式传 backend_config。
         self.backend_config = backend_config or BrowserBackendConfig.camoufox(
@@ -4704,6 +4836,10 @@ class ChatGPTBrowserRegister:
         保持兑现：按 ``self.backend_config`` 路由到 Camoufox 或 BitBrowser。
         BitBrowser 路径下 launch_opts 里的 proxy/geoip 会被忽略（profile
         自带代理）。"""
+        if self.backend_config.is_camoufox:
+            from .payment import _patch_playwright_firefox_pageerror_location_bug
+
+            _patch_playwright_firefox_pageerror_location_bug(log_fn=self.log)
         _apply_camoufox_visible_window_limit(launch_opts, self.backend_config)
         return open_browser_backend(
             launch_opts=launch_opts,
@@ -4724,48 +4860,67 @@ class ChatGPTBrowserRegister:
                 launch_opts["geoip"] = True
 
         with self._open_browser(launch_opts) as browser:
-            page = browser.new_page()
-            self.log("启动浏览器上下文注册状态机")
-            final_state = _browser_registration_flow(
-                page,
-                email,
-                password,
-                self.otp_callback,
-                self.phone_callback,
-                self.log,
-            )
-            self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
+            browser_context = None
+            try:
+                if self.backend_config.is_camoufox:
+                    browser_context = browser.new_context(no_viewport=True)
+                    page = browser_context.new_page()
+                else:
+                    page = browser.new_page()
+                self.log("启动浏览器上下文注册状态机")
+                final_state = _browser_registration_flow(
+                    page,
+                    email,
+                    password,
+                    self.otp_callback,
+                    self.phone_callback,
+                    self.log,
+                )
+                self.log(f"注册流程完成: page={final_state.get('page_type') or '-'}")
 
-            # 获取 session token 和 cookies
-            cookies_dict = _get_cookies(page)
-            session_info = _fetch_chatgpt_session_from_page(page, cookies_dict, self.log)
-            result = {
-                "email": email,
-                "password": password,
-                "account_id": session_info.get("account_id", ""),
-                "access_token": session_info.get("access_token", ""),
-                "refresh_token": session_info.get("refresh_token", ""),
-                "id_token": session_info.get("id_token", ""),
-                "session_token": session_info.get("session_token", ""),
-                "workspace_id": session_info.get("workspace_id", ""),
-                "cookies": session_info.get("cookies", "") or _cookies_to_header(cookies_dict),
-                "profile": session_info.get("profile", {}),
-                "expires_at": session_info.get("expires_at", ""),
-                "session": session_info.get("session", {}),
-                "registration_state": final_state,
-            }
+                # 获取 session token 和 cookies
+                cookies_dict = _get_cookies(page)
+                session_info = _fetch_chatgpt_session_from_page(page, cookies_dict, self.log)
+                result = {
+                    "email": email,
+                    "password": password,
+                    "account_id": session_info.get("account_id", ""),
+                    "access_token": session_info.get("access_token", ""),
+                    "refresh_token": session_info.get("refresh_token", ""),
+                    "id_token": session_info.get("id_token", ""),
+                    "session_token": session_info.get("session_token", ""),
+                    "workspace_id": session_info.get("workspace_id", ""),
+                    "cookies": session_info.get("cookies", "") or _cookies_to_header(cookies_dict),
+                    "profile": session_info.get("profile", {}),
+                    "expires_at": session_info.get("expires_at", ""),
+                    "session": session_info.get("session", {}),
+                    "registration_state": final_state,
+                }
 
-            # 短链复用流程：注册拿到 session 后、**浏览器还开着**时，在同一个
-            # page 里继续打开短链 + 抓 midtrans_url。结果合并进返回值。
-            if callable(self.post_register_in_browser):
-                try:
-                    self.log("注册完成，浏览器保持打开，继续在同一浏览器里走短链付款流程…")
-                    extra = self.post_register_in_browser(page, dict(result))
-                    if isinstance(extra, dict):
-                        result.update(extra)
-                except Exception as exc:
-                    self.log(f"浏览器内短链后续流程异常（不影响注册结果）: {exc}")
-            return result
+                if callable(self.early_save_result):
+                    try:
+                        self.log("注册 session 已获取，先保存基础账号记录")
+                        self.early_save_result(dict(result))
+                    except Exception as exc:
+                        self.log(f"基础账号提前保存失败（不影响后续流程）: {exc}")
+
+                # 短链复用流程：注册拿到 session 后、**浏览器还开着**时，在同一个
+                # page 里继续打开短链 + 抓 midtrans_url。结果合并进返回值。
+                if callable(self.post_register_in_browser):
+                    try:
+                        self.log("注册完成，浏览器保持打开，继续在同一浏览器里走短链付款流程…")
+                        extra = self.post_register_in_browser(page, dict(result))
+                        if isinstance(extra, dict):
+                            result.update(extra)
+                    except Exception as exc:
+                        self.log(f"浏览器内短链后续流程异常（不影响注册结果）: {exc}")
+                return result
+            finally:
+                if browser_context is not None:
+                    try:
+                        browser_context.close()
+                    except Exception:
+                        pass
 
     def _retry_oauth_fresh_browser(self, email, password):
         """在全新浏览器 context 里做 Codex OAuth（绕过 add_phone session）。"""
@@ -4778,13 +4933,25 @@ class ChatGPTBrowserRegister:
                 launch_opts["proxy"] = proxy
         try:
             with self._open_browser(launch_opts) as browser:
-                page = browser.new_page()
-                self.log("  全新浏览器 OAuth 开始...")
-                result = _do_codex_oauth(
-                    page, {}, email, password,
-                    self.otp_callback, self.phone_callback, self.proxy, self.log,
-                )
-                return result
+                browser_context = None
+                try:
+                    if self.backend_config.is_camoufox:
+                        browser_context = browser.new_context(no_viewport=True)
+                        page = browser_context.new_page()
+                    else:
+                        page = browser.new_page()
+                    self.log("  全新浏览器 OAuth 开始...")
+                    result = _do_codex_oauth(
+                        page, {}, email, password,
+                        self.otp_callback, self.phone_callback, self.proxy, self.log,
+                    )
+                    return result
+                finally:
+                    if browser_context is not None:
+                        try:
+                            browser_context.close()
+                        except Exception:
+                            pass
         except Exception as e:
             self.log(f"  全新浏览器 OAuth 异常: {e}")
             return None

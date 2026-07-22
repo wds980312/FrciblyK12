@@ -1,4 +1,5 @@
 """ChatGPT / Codex CLI 平台插件"""
+import json
 import os
 import re
 import secrets
@@ -173,6 +174,9 @@ class ChatGPTPlatform(BasePlatform):
         "switch_desktop",   # Switch to Codex desktop
         "upload_cpa",       # Upload to CPA system
         "upload_tm",        # Upload to Team Manager
+        "retry_workspace_export",  # Re-open saved session and export workspace CPA JSON
+        "open_local_browser",  # Open saved ChatGPT web session in host Chrome via CDP
+        "local_workspace_export",  # Listen to host Chrome workspace switches and upload CPA JSON
     ]
 
     def __init__(self, config: RegisterConfig = None, mailbox: BaseMailbox = None):
@@ -315,6 +319,7 @@ class ChatGPTPlatform(BasePlatform):
         mailbox = getattr(self, "mailbox", None)
         mailbox_account = getattr(ctx.identity, "mailbox_account", None)
         cfg = workspace_join_config(extra)
+        cfg["proxy"] = ctx.proxy or ""
         log_fn = ctx.log
 
         def _post_register(page, session_info: dict) -> dict:
@@ -349,6 +354,21 @@ class ChatGPTPlatform(BasePlatform):
         def _build_browser_worker(ctx, artifacts):
             from platforms.chatgpt.browser_register import ChatGPTBrowserRegister
 
+            early_save_account = (ctx.extra or {}).get("_early_save_account")
+
+            def _early_save_result(raw_result: dict) -> None:
+                if not callable(early_save_account):
+                    return
+                registration = self._map_chatgpt_result(
+                    dict(raw_result or {}),
+                    require_oauth=getattr(ctx.identity, "identity_provider", "") == "oauth_browser",
+                )
+                account = self._attach_identity_metadata(
+                    self._account_from_registration_result(registration),
+                    ctx.identity,
+                )
+                early_save_account(account)
+
             return ChatGPTBrowserRegister(
                 headless=(ctx.executor_type == "headless"),
                 proxy=ctx.proxy,
@@ -357,6 +377,7 @@ class ChatGPTPlatform(BasePlatform):
                 log_fn=ctx.log,
                 backend_config=(ctx.extra or {}).get("_reuse_backend_config"),
                 post_register_in_browser=self._build_post_register_in_browser_callback(ctx),
+                early_save_result=_early_save_result if callable(early_save_account) else None,
             )
 
         return BrowserRegistrationAdapter(
@@ -371,7 +392,7 @@ class ChatGPTPlatform(BasePlatform):
             ),
             oauth_runner=self._run_protocol_oauth,
             capability=RegistrationCapability(oauth_headless_requires_browser_reuse=True),
-            otp_spec=OtpSpec(wait_message="等待验证码...", timeout=600),
+            otp_spec=OtpSpec(wait_message="等待验证码...", timeout=120),
         )
 
     def build_protocol_oauth_adapter(self):
@@ -496,6 +517,33 @@ class ChatGPTPlatform(BasePlatform):
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
                  {"key": "api_key", "label": "CPA API Key", "type": "text"},
              ]},
+            {"id": "retry_workspace_export", "label": "重新导出 Workspace CPA",
+             "params": [
+                 {"key": "workspace_ids", "label": "空间 ID（留空用默认配置）", "type": "textarea",
+                  "placeholder": "每行一个 workspace id"},
+                 {"key": "browser_mode", "label": "浏览器模式", "type": "select",
+                  "options": ["camoufox_headed", "camoufox_headless"]},
+                 {"key": "cpa_output_dir", "label": "导出目录（留空默认 data/cpa_exports）", "type": "text"},
+             ]},
+            {"id": "open_local_browser", "label": "打开本地 Chrome 登录态",
+             "params": [
+                 {"key": "url", "label": "打开地址", "type": "text",
+                  "placeholder": "https://chatgpt.com/"},
+                 {"key": "chrome_cdp_url", "label": "本地 Chrome CDP 地址", "type": "text",
+                  "placeholder": "留空自动使用宿主机 IP:9222"},
+             ]},
+            {"id": "local_workspace_export", "label": "本地 Chrome 监听 Workspace 导出",
+             "params": [
+                 {"key": "workspace_ids", "label": "空间 ID（留空用默认配置）", "type": "textarea",
+                  "placeholder": "每行一个 workspace id；打开后在本地 Chrome 手动切换空间"},
+                 {"key": "chrome_cdp_url", "label": "本地 Chrome CDP 地址", "type": "text",
+                  "placeholder": "留空自动使用宿主机 IP:9222"},
+                 {"key": "timeout_sec", "label": "监听超时秒数", "type": "number"},
+                 {"key": "poll_ms", "label": "检测间隔毫秒", "type": "number"},
+                 {"key": "api_url", "label": "CPA API URL", "type": "text"},
+                 {"key": "api_key", "label": "CPA API Key", "type": "text"},
+                 {"key": "cpa_output_dir", "label": "本地备份目录（留空默认 data/cpa_exports）", "type": "text"},
+             ]},
             {"id": "upload_tm", "label": "上传 Team Manager",
              "params": [
                  {"key": "api_url", "label": "TM API URL", "type": "text"},
@@ -522,18 +570,7 @@ class ChatGPTPlatform(BasePlatform):
         proxy = self.config.proxy if self.config else None
         extra = account.extra or {}
 
-        class _A: pass
-        a = _A()
-        a.email = account.email
-        a.access_token = extra.get("access_token") or account.token
-        a.refresh_token = extra.get("refresh_token", "")
-        a.id_token = extra.get("id_token", "")
-        a.session_token = extra.get("session_token", "")
-        from .constants import OAUTH_CLIENT_ID
-        a.client_id = extra.get("client_id", OAUTH_CLIENT_ID)
-        a.cookies = extra.get("cookies", "")
-        a.user_id = account.user_id or ""
-        a.account_id = account.user_id or ""
+        a = self._cpa_account_proxy(account)
 
         if action_id == "switch_desktop":
             from platforms.chatgpt.switch import (
@@ -584,17 +621,19 @@ class ChatGPTPlatform(BasePlatform):
             return {"ok": True, "data": data}
 
         if action_id == "upload_cpa":
-            from platforms.chatgpt.cpa_upload import upload_to_cpa, generate_token_json
-            token_data = generate_token_json(a)
-            ok, msg = upload_to_cpa(token_data, api_url=params.get("api_url"),
-                                    api_key=params.get("api_key"))
-            return {"ok": ok, "data": msg}
+            return self._handle_upload_cpa(account, params)
 
         if action_id == "upload_tm":
-            from platforms.chatgpt.cpa_upload import upload_to_team_manager
-            ok, msg = upload_to_team_manager(a, api_url=params.get("api_url"),
-                                             api_key=params.get("api_key"))
-            return {"ok": ok, "data": msg}
+            return self._handle_upload_tm(account, params)
+
+        if action_id == "retry_workspace_export":
+            return self._handle_retry_workspace_export(account, params)
+
+        if action_id == "open_local_browser":
+            return self._handle_open_local_browser(account, params)
+
+        if action_id == "local_workspace_export":
+            return self._handle_local_workspace_export(account, params)
 
         if action_id == "payment_link":
             return self._handle_generate_link(account, params)
@@ -602,6 +641,1538 @@ class ChatGPTPlatform(BasePlatform):
         raise NotImplementedError(f"Unknown action: {action_id}")
 
     # Override specific capability handlers
+    def _cpa_account_proxy(self, account: Account):
+        extra = account.extra or {}
+
+        class _A:
+            pass
+
+        a = _A()
+        a.email = account.email
+        a.access_token = extra.get("access_token") or account.token
+        a.refresh_token = extra.get("refresh_token", "")
+        a.id_token = extra.get("id_token", "")
+        a.session_token = extra.get("session_token", "")
+        from .constants import OAUTH_CLIENT_ID
+        a.client_id = extra.get("client_id", OAUTH_CLIENT_ID)
+        a.cookies = extra.get("cookies", "")
+        account_id = (
+            extra.get("account_id")
+            or extra.get("chatgpt_account_id")
+            or extra.get("workspace_id")
+            or account.user_id
+            or ""
+        )
+        a.user_id = account.user_id or account_id
+        a.account_id = account_id
+        return a
+
+    def _handle_upload_cpa(self, account: Account, params: dict) -> dict:
+        from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
+
+        extra = account.extra or {}
+        workspace_join = extra.get("workspace_join") if isinstance(extra, dict) else {}
+        cpa_exports = []
+        if isinstance(workspace_join, dict):
+            cpa_exports = [item for item in workspace_join.get("cpa_exports") or [] if isinstance(item, dict)]
+
+        uploads = []
+        uploaded_paths: set[str] = set()
+        for item in cpa_exports:
+            path = str(item.get("path") or "").strip()
+            if not path or path in uploaded_paths:
+                continue
+            uploaded_paths.add(path)
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    token_data = json.load(fh)
+                workspace_id = str(item.get("workspace_id") or item.get("account_id") or "").strip()
+                workspace_label = (workspace_id or str(token_data.get("account_id") or path))[0:8]
+                filename = f"{token_data.get('email') or account.email}-{workspace_label}.json"
+                ok, msg = upload_to_cpa(
+                    token_data,
+                    api_url=params.get("api_url"),
+                    api_key=params.get("api_key"),
+                    filename=filename,
+                )
+                uploads.append(
+                    {
+                        "ok": bool(ok),
+                        "message": msg,
+                        "workspace_id": workspace_id,
+                        "filename": filename,
+                    }
+                )
+            except Exception as exc:
+                uploads.append(
+                    {
+                        "ok": False,
+                        "message": str(exc),
+                        "workspace_id": str(item.get("workspace_id") or ""),
+                        "filename": "",
+                    }
+                )
+        if uploaded_paths:
+            if all(item.get("ok") for item in uploads):
+                return {
+                    "ok": True,
+                    "data": {
+                        "message": f"uploaded {len(uploads)} workspace CPA files",
+                        "email": account.email,
+                        "uploads": uploads,
+                    },
+                }
+            failed = "; ".join(str(item.get("message") or "") for item in uploads if not item.get("ok"))
+            return {"ok": False, "error": failed or "workspace CPA upload failed", "data": {"uploads": uploads}}
+
+        token_data = generate_token_json(self._cpa_account_proxy(account))
+        ok, msg = upload_to_cpa(
+            token_data,
+            api_url=params.get("api_url"),
+            api_key=params.get("api_key"),
+        )
+        if ok:
+            return {"ok": True, "data": {"message": msg, "email": account.email}}
+        return {"ok": False, "error": msg}
+
+    def _handle_upload_tm(self, account: Account, params: dict) -> dict:
+        from platforms.chatgpt.cpa_upload import upload_to_team_manager
+
+        ok, msg = upload_to_team_manager(
+            self._cpa_account_proxy(account),
+            api_url=params.get("api_url"),
+            api_key=params.get("api_key"),
+        )
+        if ok:
+            return {"ok": True, "data": {"message": msg, "email": account.email}}
+        return {"ok": False, "error": msg}
+
+    def _handle_retry_workspace_export(self, account: Account, params: dict) -> dict:
+        log_fn = getattr(self, "log", print)
+        cancel_fn = getattr(self, "_cancel_check_fn", None)
+        extra = account.extra or {}
+        cookies = str(extra.get("cookies") or "").strip()
+        if not cookies:
+            return {"ok": False, "error": "账号缺少 cookies，无法恢复网页登录态重新导出"}
+
+        from platforms._browser_backend import parse_checkout_mode
+        from platforms.chatgpt.browser_register import (
+            ChatGPTBrowserRegister,
+            _build_proxy_config,
+            _do_codex_oauth,
+            _get_cookies,
+        )
+        from platforms.chatgpt.constants import CODEX_CLIENT_ID, CODEX_REDIRECT_URI, CODEX_SCOPE
+        from platforms.chatgpt.cpa_session import (
+            convert_chatgpt_session_to_cpa_json,
+            save_cpa_json_locally,
+        )
+        from platforms.chatgpt.oauth import generate_oauth_url
+        from platforms.chatgpt.payment import _parse_cookie_str
+        from platforms.chatgpt.workspace_join import (
+            parse_workspace_ids,
+            workspace_join_config,
+        )
+
+        cfg = workspace_join_config(extra)
+        cfg["enabled"] = True
+        cfg["accept_invite"] = True
+        cfg["export_cpa_json"] = True
+        if str(params.get("workspace_ids") or "").strip():
+            cfg["workspace_ids"] = str(params.get("workspace_ids") or "")
+        if str(params.get("cpa_output_dir") or "").strip():
+            cfg["cpa_output_dir"] = str(params.get("cpa_output_dir") or "").strip()
+        workspace_ids = parse_workspace_ids(cfg.get("workspace_ids"))
+
+        browser_mode = str(params.get("browser_mode") or "camoufox_headed")
+        backend_config = parse_checkout_mode(browser_mode)
+        proxy = self.config.proxy if self.config else None
+        reg = ChatGPTBrowserRegister(
+            headless=backend_config.is_headless,
+            proxy=proxy,
+            log_fn=log_fn,
+            backend_config=backend_config,
+        )
+
+        if reg.backend_config.is_bitbrowser:
+            launch_opts = {"headless": reg.backend_config.is_headless}
+        else:
+            cam_proxy = _build_proxy_config(reg.proxy)
+            launch_opts = {"headless": reg.headless}
+            if cam_proxy:
+                launch_opts["proxy"] = cam_proxy
+
+        log_fn(f"Workspace Join: 使用已保存账号重新导出 CPA，email={account.email}, browser_mode={browser_mode}")
+        try:
+            with reg._open_browser(launch_opts) as browser:
+                browser_context = None
+                try:
+                    if reg.backend_config.is_camoufox:
+                        browser_context = browser.new_context(no_viewport=True)
+                        page = browser_context.new_page()
+                    else:
+                        page = browser.new_page()
+                    injected = 0
+                    for domain in ("chatgpt.com", "openai.com"):
+                        try:
+                            parsed = _parse_cookie_str(cookies, domain)
+                            if parsed:
+                                page.context.add_cookies(parsed)
+                                injected += len(parsed)
+                        except Exception as exc:
+                            log_fn(f"Workspace Join: 注入 {domain} cookie 失败，继续尝试: {exc}")
+                    log_fn(f"Workspace Join: 已注入网页登录 cookie {injected} 项")
+                    result = {
+                        "workspace_join": {
+                            "ok": True,
+                            "workspace_ids": workspace_ids,
+                            "configured_workspace_ids": workspace_ids,
+                            "request_results": [],
+                            "cpa_export": None,
+                            "cpa_exports": [],
+                            "export_errors": [],
+                            "export_skipped": [],
+                            "method": "codex_oauth_workspace_select",
+                        }
+                    }
+                    top_level_updates = {}
+                    exported_account_ids: set[str] = set()
+                    for workspace_id in workspace_ids:
+                        if callable(cancel_fn) and cancel_fn():
+                            return {"ok": False, "error": "任务已取消"}
+                        try:
+                            log_fn(f"Workspace Join: OAuth 选择 workspace {workspace_id[:8]} 并换取 CPA token")
+                            oauth_start = generate_oauth_url(
+                                redirect_uri=CODEX_REDIRECT_URI,
+                                scope=CODEX_SCOPE,
+                                client_id=CODEX_CLIENT_ID,
+                            )
+                            oauth_result = _do_codex_oauth(
+                                page,
+                                _get_cookies(page),
+                                account.email,
+                                account.password or "",
+                                None,
+                                None,
+                                proxy,
+                                log_fn,
+                                oauth_start=oauth_start,
+                                target_workspace_id=workspace_id,
+                            )
+                            if not isinstance(oauth_result, dict) or not oauth_result.get("access_token"):
+                                raise RuntimeError(f"OAuth 未返回 access_token: {oauth_result}")
+                            cpa_json = convert_chatgpt_session_to_cpa_json(oauth_result)
+                            account_id = str(cpa_json.get("account_id") or "").strip()
+                            if account_id != workspace_id:
+                                raise RuntimeError(
+                                    "workspace account_id mismatch: "
+                                    f"target={workspace_id}, session_account_id={account_id or '-'}"
+                                )
+                            if account_id in exported_account_ids:
+                                raise RuntimeError(f"duplicate workspace account_id exported: {account_id}")
+                            export_email = str(cpa_json.get("email") or account.email)
+                            path = save_cpa_json_locally(
+                                cpa_json,
+                                email=f"{export_email}-{workspace_id[:8]}",
+                                output_dir=str(cfg.get("cpa_output_dir") or "").strip() or None,
+                            )
+                            safe_export = {
+                                "ok": True,
+                                "path": str(path),
+                                "workspace_id": workspace_id,
+                                "account_id": account_id,
+                                "email": str(cpa_json.get("email") or account.email),
+                                "expired": str(cpa_json.get("expired") or ""),
+                                "method": "codex_oauth_workspace_select",
+                            }
+                            result["workspace_join"]["cpa_exports"].append(safe_export)
+                            exported_account_ids.add(account_id)
+                            if result["workspace_join"]["cpa_export"] is None:
+                                result["workspace_join"]["cpa_export"] = safe_export
+                            if not top_level_updates:
+                                for source_key, target_key in (
+                                    ("access_token", "access_token"),
+                                    ("refresh_token", "refresh_token"),
+                                    ("id_token", "id_token"),
+                                    ("session_token", "session_token"),
+                                    ("account_id", "account_id"),
+                                    ("expired", "expires_at"),
+                                ):
+                                    value = cpa_json.get(source_key)
+                                    if value not in (None, ""):
+                                        top_level_updates[target_key] = value
+                                top_level_updates["workspace_id"] = workspace_id
+                            log_fn(f"Workspace Join: CPA JSON saved to {path}")
+                        except Exception as exc:
+                            error = f"{workspace_id}: {exc}"
+                            result["workspace_join"]["export_errors"].append(error)
+                            log_fn(f"Workspace Join: {workspace_id[:8]} OAuth 导出失败，已跳过: {exc}")
+                    if result["workspace_join"]["export_errors"]:
+                        result["workspace_join"]["export_partial_error"] = (
+                            "Workspace Join OAuth export partial failed: "
+                            + "; ".join(result["workspace_join"]["export_errors"])
+                        )
+                    if result["workspace_join"]["cpa_export"] is None and result["workspace_join"]["export_errors"]:
+                        result["workspace_join"]["cpa_export"] = {
+                            "ok": False,
+                            "error": "; ".join(result["workspace_join"]["export_errors"]),
+                        }
+                    result.update(top_level_updates)
+                finally:
+                    if browser_context is not None:
+                        try:
+                            browser_context.close()
+                        except Exception:
+                            pass
+        except Exception as exc:
+            return {"ok": False, "error": f"重新导出 Workspace CPA 失败: {exc}"}
+
+        workspace_join = result.get("workspace_join") if isinstance(result, dict) else {}
+        exports = []
+        errors = []
+        if isinstance(workspace_join, dict):
+            exports = [item for item in workspace_join.get("cpa_exports") or [] if isinstance(item, dict)]
+            errors = [str(item) for item in workspace_join.get("export_errors") or [] if str(item)]
+        data = dict(result or {})
+        data["email"] = account.email
+        data["message"] = f"workspace CPA exported: {len(exports)} file(s)"
+        if errors:
+            data["message"] += f", partial errors: {len(errors)}"
+        return {"ok": True, "data": data}
+
+    def _handle_open_local_browser(self, account: Account, params: dict) -> dict:
+        extra = account.extra or {}
+        cookies = str(extra.get("cookies") or "").strip()
+        if not cookies:
+            return {"ok": False, "error": "账号缺少 cookies，无法打开本地 Chrome 登录态"}
+
+        url = str(params.get("url") or "").strip() or "https://chatgpt.com/"
+        if not re.match(r"^https://(chatgpt\.com|auth\.openai\.com|openai\.com)(/|$)", url):
+            return {"ok": False, "error": "只允许打开 chatgpt.com / auth.openai.com / openai.com 地址"}
+
+        requested_cdp_url = str(params.get("chrome_cdp_url") or "").strip()
+        cdp_url = requested_cdp_url or self._default_host_chrome_cdp_url()
+        local_chrome_command = (
+            "/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
+            "--remote-debugging-port=9222 "
+            "--user-data-dir=/tmp/chatgpt-local-cdp-profile"
+        )
+
+        try:
+            browser_cookies = self._build_local_chrome_cookie_injection(cookies)
+            open_result = self._open_host_chrome_via_cdp(
+                cdp_url=cdp_url,
+                url=url,
+                cookies=browser_cookies,
+            )
+            return {
+                "ok": True,
+                "data": {
+                    "message": "已在本地 Chrome 打开登录态页面",
+                    "url": url,
+                    "chrome_cdp_url": cdp_url,
+                    "cookies_injected": open_result.get("cookies_injected", 0),
+                    "cookies_skipped": open_result.get("cookies_skipped", 0),
+                },
+            }
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": (
+                    f"连接本地 Chrome 失败: {exc}. "
+                    "请先在 Mac 终端启动带 CDP 的 Chrome: "
+                    f"{local_chrome_command}"
+                ),
+                "data": {
+                    "chrome_cdp_url": cdp_url,
+                    "local_chrome_command": local_chrome_command,
+                },
+            }
+
+    def _handle_local_workspace_export(self, account: Account, params: dict) -> dict:
+        extra = account.extra or {}
+        cookies = str(extra.get("cookies") or "").strip()
+        if not cookies:
+            return {"ok": False, "error": "账号缺少 cookies，无法在本地 Chrome 恢复登录态"}
+
+        from core.base_mailbox import MailboxAccount
+        from platforms.chatgpt.workspace_join import (
+            _apply_alias_workspace_policy,
+            parse_workspace_ids,
+            workspace_join_config,
+        )
+
+        cfg = workspace_join_config(extra)
+        if str(params.get("workspace_ids") or "").strip():
+            cfg["workspace_ids"] = str(params.get("workspace_ids") or "")
+        configured_workspace_ids = parse_workspace_ids(cfg.get("workspace_ids"))
+        mailbox_account = MailboxAccount(
+            email=account.email,
+            account_id=str((extra.get("provider_resource") or {}).get("id") or account.email),
+            extra=extra,
+        )
+        workspace_ids, alias_policy_skipped = _apply_alias_workspace_policy(
+            configured_workspace_ids,
+            mailbox_account=mailbox_account,
+            config=cfg,
+            log=getattr(self, "log", print),
+        )
+        if not workspace_ids:
+            if alias_policy_skipped:
+                return {
+                    "ok": True,
+                    "data": {
+                        "message": "本地 Chrome Workspace 导出: 当前别名空间均被 alias policy 跳过",
+                        "workspace_ids": [],
+                        "configured_workspace_ids": configured_workspace_ids,
+                        "alias_policy_skipped": alias_policy_skipped,
+                    },
+                }
+            return {"ok": False, "error": "缺少 workspace_ids，无法监听导出"}
+
+        requested_cdp_url = str(params.get("chrome_cdp_url") or "").strip()
+        cdp_url = requested_cdp_url or self._default_host_chrome_cdp_url()
+        timeout_sec = max(_int_param(params, "timeout_sec", 180), 30)
+        poll_ms = max(_int_param(params, "poll_ms", 2000), 100)
+        local_chrome_command = (
+            "/Applications/Google\\ Chrome.app/Contents/MacOS/Google\\ Chrome "
+            "--remote-debugging-port=9222 "
+            "--user-data-dir=/tmp/chatgpt-local-cdp-profile"
+        )
+
+        try:
+            browser_cookies = self._build_local_chrome_cookie_injection(cookies)
+            export_result = self._export_workspace_cpa_from_local_chrome_via_cdp(
+                cdp_url=cdp_url,
+                cookies=browser_cookies,
+                workspace_ids=workspace_ids,
+                account_email=account.email,
+                timeout_sec=timeout_sec,
+                poll_ms=poll_ms,
+                api_url=params.get("api_url"),
+                api_key=params.get("api_key"),
+                output_dir=str(params.get("cpa_output_dir") or "").strip() or None,
+                log=getattr(self, "log", print),
+                cancel_check=getattr(self, "_cancel_check_fn", None),
+            )
+        except Exception as exc:
+            return {
+                "ok": False,
+                "error": (
+                    f"本地 Chrome Workspace 导出失败: {exc}. "
+                    "请先在 Mac 终端启动带 CDP 的 Chrome: "
+                    f"{local_chrome_command}"
+                ),
+                "data": {
+                    "chrome_cdp_url": cdp_url,
+                    "local_chrome_command": local_chrome_command,
+                },
+            }
+
+        uploaded_count = int(export_result.get("uploaded_count") or 0)
+        total = len(workspace_ids)
+        missing = list(export_result.get("missing_workspace_ids") or [])
+        message = f"本地 Chrome 已捕获并上传 {uploaded_count}/{total} 个 workspace"
+        if missing:
+            message += f"，未捕获 {len(missing)} 个"
+        data = dict(export_result)
+        data.update(
+            {
+                "message": message,
+                "email": account.email,
+                "workspace_ids": workspace_ids,
+                "configured_workspace_ids": configured_workspace_ids,
+                "alias_policy_skipped": alias_policy_skipped,
+                "chrome_cdp_url": cdp_url,
+            }
+        )
+        return {"ok": uploaded_count == total and not missing, "data": data}
+
+    def _build_local_chrome_cookie_injection(self, cookies: str) -> list[dict]:
+        from platforms.chatgpt.payment import _parse_cookie_str
+
+        browser_cookies: list[dict] = []
+        for domain in ("chatgpt.com", "openai.com"):
+            parsed_cookies = _parse_cookie_str(cookies, domain)
+            parsed_cookies = self._filter_local_chrome_cookies_for_domain(
+                parsed_cookies,
+                domain=domain,
+            )
+            browser_cookies.extend(
+                self._normalize_local_chrome_cookie_list(
+                    parsed_cookies,
+                    domain=domain,
+                )
+            )
+        return browser_cookies
+
+    @staticmethod
+    def _workspace_id_matches_local(account_id: str, workspace_id: str) -> bool:
+        account_id = str(account_id or "").strip()
+        workspace_id = str(workspace_id or "").strip()
+        if not account_id or not workspace_id:
+            return False
+        return account_id == workspace_id or account_id.startswith(workspace_id) or workspace_id.startswith(account_id)
+
+    @staticmethod
+    def _export_workspace_cpa_from_local_chrome_via_cdp(
+        *,
+        cdp_url: str,
+        cookies: list[dict],
+        workspace_ids: list[str],
+        account_email: str = "",
+        timeout_sec: int = 600,
+        poll_ms: int = 2000,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        output_dir: str | None = None,
+        log=None,
+        cancel_check=None,
+    ) -> dict:
+        import base64
+        import hashlib
+        import json as _json
+        import os
+        import socket
+        import struct
+        import urllib.parse
+        import urllib.request
+
+        from platforms.chatgpt.cpa_session import (
+            convert_chatgpt_session_to_cpa_json,
+            save_cpa_json_locally,
+        )
+        from platforms.chatgpt.cpa_upload import upload_to_cpa
+
+        def safe_log(message: str) -> None:
+            if callable(log):
+                try:
+                    log(message)
+                except Exception:
+                    pass
+
+        target_ids = [str(item or "").strip() for item in workspace_ids if str(item or "").strip()]
+        target_set = set(target_ids)
+        if not target_ids:
+            raise RuntimeError("workspace_ids is empty")
+
+        try:
+            return ChatGPTPlatform._export_workspace_cpa_from_local_chrome_via_playwright_cdp(
+                cdp_url=cdp_url,
+                cookies=cookies,
+                workspace_ids=target_ids,
+                account_email=account_email,
+                timeout_sec=timeout_sec,
+                poll_ms=poll_ms,
+                api_url=api_url,
+                api_key=api_key,
+                output_dir=output_dir,
+                log=log,
+                cancel_check=cancel_check,
+            )
+        except Exception as exc:
+            safe_log(f"本地 Chrome Workspace 导出: Playwright CDP 路径失败，回退裸 CDP: {str(exc)[:160]}")
+
+        base = str(cdp_url or "").rstrip("/")
+        target: dict = {}
+        reused_existing_target = False
+        try:
+            with urllib.request.urlopen(f"{base}/json/list", timeout=5) as response:
+                targets = _json.loads(response.read().decode("utf-8"))
+            if isinstance(targets, list):
+                target = ChatGPTPlatform._choose_existing_chatgpt_cdp_target(targets)
+                reused_existing_target = bool(target)
+        except Exception:
+            target = {}
+
+        if not target:
+            create_url = f"{base}/json/new?{urllib.parse.quote('about:blank', safe='')}"
+            request = urllib.request.Request(create_url, method="PUT")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                target = _json.loads(response.read().decode("utf-8"))
+        ws_url = str(target.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            raise RuntimeError("Chrome CDP did not return webSocketDebuggerUrl")
+
+        parsed = urllib.parse.urlparse(ws_url)
+        if parsed.scheme != "ws":
+            raise RuntimeError(f"unsupported CDP websocket scheme: {parsed.scheme}")
+        host = parsed.hostname or ""
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        sock = socket.create_connection((host, port), timeout=5)
+        try:
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            handshake = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "\r\n"
+            )
+            sock.sendall(handshake.encode("ascii"))
+            header = b""
+            while b"\r\n\r\n" not in header:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                header += chunk
+                if len(header) > 16384:
+                    break
+            if b" 101 " not in header.split(b"\r\n", 1)[0]:
+                raise RuntimeError(f"CDP websocket handshake failed: {header[:200]!r}")
+            accept = ""
+            for line in header.decode("iso-8859-1", "replace").splitlines():
+                if line.lower().startswith("sec-websocket-accept:"):
+                    accept = line.split(":", 1)[1].strip()
+                    break
+            expected_accept = base64.b64encode(
+                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+            ).decode("ascii")
+            if accept and accept != expected_accept:
+                raise RuntimeError("CDP websocket accept key mismatch")
+
+            next_id = 0
+
+            def send_frame(payload: str) -> None:
+                raw = payload.encode("utf-8")
+                mask_key = os.urandom(4)
+                if len(raw) < 126:
+                    header_bytes = bytes([0x81, 0x80 | len(raw)])
+                elif len(raw) < 65536:
+                    header_bytes = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(raw))
+                else:
+                    header_bytes = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", len(raw))
+                masked = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(raw))
+                sock.sendall(header_bytes + mask_key + masked)
+
+            def recv_exact(length: int) -> bytes:
+                data = b""
+                while len(data) < length:
+                    chunk = sock.recv(length - len(data))
+                    if not chunk:
+                        raise RuntimeError("CDP websocket closed")
+                    data += chunk
+                return data
+
+            def recv_frame() -> dict:
+                first = recv_exact(2)
+                opcode = first[0] & 0x0F
+                length = first[1] & 0x7F
+                masked = bool(first[1] & 0x80)
+                if length == 126:
+                    length = struct.unpack("!H", recv_exact(2))[0]
+                elif length == 127:
+                    length = struct.unpack("!Q", recv_exact(8))[0]
+                mask_key = recv_exact(4) if masked else b""
+                payload = recv_exact(length) if length else b""
+                if masked:
+                    payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+                if opcode == 8:
+                    raise RuntimeError("CDP websocket closed by browser")
+                if opcode not in (1, 2):
+                    return {}
+                text = payload.decode("utf-8", "replace")
+                return _json.loads(text) if text else {}
+
+            def call(method: str, params: dict | None = None) -> dict:
+                nonlocal next_id
+                next_id += 1
+                message_id = next_id
+                send_frame(_json.dumps({"id": message_id, "method": method, "params": params or {}}))
+                while True:
+                    message = recv_frame()
+                    if message.get("id") != message_id:
+                        continue
+                    if message.get("error"):
+                        raise RuntimeError(f"{method} failed: {message['error']}")
+                    return dict(message.get("result") or {})
+
+            injected = 0
+            skipped = 0
+            for method in ("Network.enable", "Runtime.enable", "Page.enable"):
+                try:
+                    call(method, {})
+                except Exception:
+                    pass
+            for cookie in ([] if reused_existing_target else (cookies or [])):
+                try:
+                    call("Network.setCookies", {"cookies": [cookie]})
+                    injected += 1
+                except Exception:
+                    skipped += 1
+
+            if reused_existing_target:
+                safe_log("本地 Chrome Workspace 导出: 复用已打开的 ChatGPT 标签页")
+            else:
+                call("Page.navigate", {"url": "https://chatgpt.com/"})
+            try:
+                call("Page.bringToFront", {})
+            except Exception:
+                pass
+            ChatGPTPlatform._wait_local_chrome_chatgpt_ready(call, timeout_sec=30, log=safe_log)
+            safe_log(
+                "本地 Chrome Workspace 导出: 已打开 chatgpt.com，"
+                f"请手动切换 {len(target_ids)} 个空间"
+            )
+
+            poll_expression = """
+            (async () => {
+              const response = await fetch("/api/auth/session", {
+                method: "GET",
+                credentials: "include",
+                cache: "no-store",
+                headers: { accept: "*/*" },
+              });
+              const text = await response.text().catch(() => "");
+              let json = {};
+              try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+              return { ok: response.ok, status: response.status, text: text.slice(0, 160), json };
+            })()
+            """
+            captured: list[dict] = []
+            captured_ids: set[str] = set()
+            last_seen = ""
+
+            def capture_cpa_json(
+                cpa_json: dict,
+                *,
+                matched_workspace: str,
+                account_id: str,
+                method: str,
+            ) -> None:
+                export_email = str(cpa_json.get("email") or account_email or "")
+                path = save_cpa_json_locally(
+                    cpa_json,
+                    email=f"{export_email}-{matched_workspace[:8]}",
+                    output_dir=output_dir,
+                )
+                filename = f"{export_email or account_email}-{matched_workspace[:8]}.json"
+                ok, msg = upload_to_cpa(
+                    cpa_json,
+                    api_url=api_url,
+                    api_key=api_key,
+                    filename=filename,
+                )
+                item = {
+                    "ok": bool(ok),
+                    "message": msg,
+                    "path": str(path),
+                    "workspace_id": matched_workspace,
+                    "account_id": account_id,
+                    "email": str(cpa_json.get("email") or account_email or ""),
+                    "expired": str(cpa_json.get("expired") or ""),
+                    "filename": filename,
+                    "method": method,
+                }
+                captured.append(item)
+                captured_ids.add(matched_workspace)
+                safe_log(
+                    "本地 Chrome Workspace 导出: "
+                    f"已捕获 {matched_workspace[:8]}，CPA 上传{'成功' if ok else '失败'}"
+                )
+
+            safe_log("本地 Chrome Workspace 导出: 尝试按 workspace_id 自动切换并导出")
+            for workspace_id in target_ids:
+                if workspace_id in captured_ids:
+                    continue
+                if callable(cancel_check) and cancel_check():
+                    raise RuntimeError("任务已取消")
+                exchange_expression = f"""
+                (async () => {{
+                  const workspaceId = {_json.dumps(workspace_id)};
+                  const url = `/api/auth/session?exchange_workspace_token=true&workspace_id=${{encodeURIComponent(workspaceId)}}&reason=setCurrentAccount`;
+                  const response = await fetch(url, {{
+                    method: "GET",
+                    credentials: "include",
+                    cache: "no-store",
+                    headers: {{
+                      accept: "*/*",
+                      "Chatgpt-Account-Id": workspaceId,
+                      "chatgpt-account-id": workspaceId,
+                    }},
+                  }});
+                  const text = await response.text().catch(() => "");
+                  let json = {{}};
+                  try {{ json = text ? JSON.parse(text) : {{}}; }} catch (_) {{}}
+                  return {{ ok: response.ok, status: response.status, text: text.slice(0, 160), json }};
+                }})()
+                """
+                try:
+                    evaluated = call(
+                        "Runtime.evaluate",
+                        {
+                            "expression": exchange_expression,
+                            "awaitPromise": True,
+                            "returnByValue": True,
+                        },
+                    )
+                    if evaluated.get("exceptionDetails"):
+                        raise RuntimeError("Runtime.evaluate exception")
+                    value = dict(dict(evaluated.get("result") or {}).get("value") or {})
+                    if not value.get("ok"):
+                        raise RuntimeError(f"session exchange HTTP {value.get('status')}: {value.get('text') or ''}")
+                    session = value.get("json")
+                    if not isinstance(session, dict):
+                        raise RuntimeError(f"session exchange did not return JSON: HTTP {value.get('status')}")
+                    cpa_json = convert_chatgpt_session_to_cpa_json(session)
+                    account_id = str(cpa_json.get("account_id") or "").strip()
+                    if not ChatGPTPlatform._workspace_id_matches_local(account_id, workspace_id):
+                        raise RuntimeError(f"account_id mismatch: {account_id or '-'}")
+                    capture_cpa_json(
+                        cpa_json,
+                        matched_workspace=workspace_id,
+                        account_id=account_id,
+                        method="local_chrome_session_exchange",
+                    )
+                except Exception as exc:
+                    safe_log(
+                        "本地 Chrome Workspace 导出: "
+                        f"{workspace_id[:8]} 自动切换失败，保留监听兜底: {str(exc)[:120]}"
+                    )
+
+            deadline = time.monotonic() + max(int(timeout_sec), 1)
+            sleep_seconds = max(int(poll_ms), 100) / 1000
+
+            while time.monotonic() < deadline and target_set - captured_ids:
+                if callable(cancel_check) and cancel_check():
+                    raise RuntimeError("任务已取消")
+                try:
+                    evaluated = call(
+                        "Runtime.evaluate",
+                        {
+                            "expression": poll_expression,
+                            "awaitPromise": True,
+                            "returnByValue": True,
+                        },
+                    )
+                    if evaluated.get("exceptionDetails"):
+                        raise RuntimeError("Runtime.evaluate exception")
+                    value = dict(dict(evaluated.get("result") or {}).get("value") or {})
+                    session = value.get("json")
+                    if not isinstance(session, dict):
+                        raise RuntimeError(f"session API did not return JSON: HTTP {value.get('status')}")
+                    cpa_json = convert_chatgpt_session_to_cpa_json(session)
+                    account_id = str(cpa_json.get("account_id") or "").strip()
+                    matched_workspace = next(
+                        (
+                            workspace_id
+                            for workspace_id in target_ids
+                            if ChatGPTPlatform._workspace_id_matches_local(account_id, workspace_id)
+                        ),
+                        "",
+                    )
+                    if account_id and account_id != last_seen:
+                        last_seen = account_id
+                        safe_log(f"本地 Chrome Workspace 导出: 当前 session account_id={account_id[:8]}")
+                    if matched_workspace and matched_workspace not in captured_ids:
+                        capture_cpa_json(
+                            cpa_json,
+                            matched_workspace=matched_workspace,
+                            account_id=account_id,
+                            method="local_chrome_session_listener",
+                        )
+                except Exception as exc:
+                    text = str(exc)
+                    if "missing accessToken" not in text and "session API did not return JSON" not in text:
+                        safe_log(f"本地 Chrome Workspace 导出: 本轮检测失败，继续监听: {text[:160]}")
+                time.sleep(sleep_seconds)
+
+            missing = [workspace_id for workspace_id in target_ids if workspace_id not in captured_ids]
+            if missing:
+                safe_log(f"本地 Chrome Workspace 导出: 超时/未捕获 {len(missing)} 个空间")
+            return {
+                "captured": captured,
+                "uploaded_count": sum(1 for item in captured if item.get("ok")),
+                "missing_workspace_ids": missing,
+                "cookies_injected": injected,
+                "cookies_skipped": skipped,
+            }
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _choose_existing_chatgpt_cdp_target(targets: list[dict]) -> dict:
+        for target in targets or []:
+            if str(target.get("type") or "") != "page":
+                continue
+            url = str(target.get("url") or "")
+            if not (url == "https://chatgpt.com/" or url.startswith("https://chatgpt.com/")):
+                continue
+            if not str(target.get("webSocketDebuggerUrl") or ""):
+                continue
+            return dict(target)
+        return {}
+
+    @staticmethod
+    def _export_workspace_cpa_from_local_chrome_via_playwright_cdp(
+        *,
+        cdp_url: str,
+        cookies: list[dict],
+        workspace_ids: list[str],
+        account_email: str = "",
+        timeout_sec: int = 600,
+        poll_ms: int = 2000,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        output_dir: str | None = None,
+        log=None,
+        cancel_check=None,
+    ) -> dict:
+        from playwright.sync_api import sync_playwright
+
+        from platforms.chatgpt.cpa_session import (
+            convert_chatgpt_session_to_cpa_json,
+            save_cpa_json_locally,
+        )
+        from platforms.chatgpt.cpa_upload import upload_to_cpa
+
+        def safe_log(message: str) -> None:
+            if callable(log):
+                try:
+                    log(message)
+                except Exception:
+                    pass
+
+        target_ids = [str(item or "").strip() for item in workspace_ids if str(item or "").strip()]
+        target_set = set(target_ids)
+        captured: list[dict] = []
+        captured_ids: set[str] = set()
+
+        def capture_cpa_json(cpa_json: dict, *, matched_workspace: str, account_id: str, method: str) -> None:
+            export_email = str(cpa_json.get("email") or account_email or "")
+            path = save_cpa_json_locally(
+                cpa_json,
+                email=f"{export_email}-{matched_workspace[:8]}",
+                output_dir=output_dir,
+            )
+            filename = f"{export_email or account_email}-{matched_workspace[:8]}.json"
+            ok, msg = upload_to_cpa(
+                cpa_json,
+                api_url=api_url,
+                api_key=api_key,
+                filename=filename,
+            )
+            captured.append(
+                {
+                    "ok": bool(ok),
+                    "message": msg,
+                    "path": str(path),
+                    "workspace_id": matched_workspace,
+                    "account_id": account_id,
+                    "email": str(cpa_json.get("email") or account_email or ""),
+                    "expired": str(cpa_json.get("expired") or ""),
+                    "filename": filename,
+                    "method": method,
+                }
+            )
+            captured_ids.add(matched_workspace)
+            safe_log(
+                "本地 Chrome Workspace 导出: "
+                f"已捕获 {matched_workspace[:8]}，CPA 上传{'成功' if ok else '失败'}"
+            )
+
+        session_expression = """
+        async () => {
+          const response = await fetch("/api/auth/session", {
+            method: "GET",
+            credentials: "include",
+            cache: "no-store",
+            headers: { accept: "*/*" },
+          });
+          const text = await response.text().catch(() => "");
+          let json = {};
+          try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+          return { ok: response.ok, status: response.status, text: text.slice(0, 160), json };
+        }
+        """
+        exchange_expression = """
+        async (workspaceId) => {
+          const url = "/api/auth/session?exchange_workspace_token=true&workspace_id="
+            + encodeURIComponent(workspaceId) + "&reason=setCurrentAccount";
+          const response = await fetch(url, {
+            method: "GET",
+            credentials: "include",
+            cache: "no-store",
+            headers: {
+              accept: "*/*",
+              "Chatgpt-Account-Id": workspaceId,
+              "chatgpt-account-id": workspaceId,
+            },
+          });
+          const text = await response.text().catch(() => "");
+          let json = {};
+          try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+          return { ok: response.ok, status: response.status, text: text.slice(0, 160), json };
+        }
+        """
+
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.connect_over_cdp(cdp_url)
+            try:
+                contexts = list(browser.contexts)
+                if not contexts:
+                    raise RuntimeError("local Chrome has no browser context")
+                pages = [
+                    page
+                    for context in contexts
+                    for page in context.pages
+                    if "chatgpt.com" in str(page.url)
+                ]
+                reused_existing_page = bool(pages)
+                context = pages[0].context if reused_existing_page else contexts[0]
+                page = pages[0] if reused_existing_page else context.new_page()
+                if reused_existing_page:
+                    safe_log("本地 Chrome Workspace 导出: 复用已打开的 ChatGPT 标签页")
+                else:
+                    if cookies:
+                        normalized_cookies = ChatGPTPlatform._normalize_local_chrome_cookies_for_playwright(
+                            cookies,
+                            default_domain="chatgpt.com",
+                        )
+                        context.add_cookies(normalized_cookies)
+                    page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=60000)
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
+
+                deadline = time.monotonic() + 30
+                initial_account_id = ""
+                while time.monotonic() <= deadline:
+                    if callable(cancel_check) and cancel_check():
+                        raise RuntimeError("任务已取消")
+                    value = page.evaluate(session_expression)
+                    session = dict(value or {}).get("json")
+                    if isinstance(session, dict):
+                        try:
+                            cpa_json = convert_chatgpt_session_to_cpa_json(session)
+                            initial_account_id = str(cpa_json.get("account_id") or "")
+                            break
+                        except Exception:
+                            pass
+                    time.sleep(0.5)
+                if not initial_account_id:
+                    raise RuntimeError("ChatGPT session not ready in local Chrome")
+                safe_log(f"本地 Chrome Workspace 导出: ChatGPT session 已就绪 account_id={initial_account_id[:8]}")
+                safe_log(
+                    "本地 Chrome Workspace 导出: 已打开 chatgpt.com，"
+                    f"请手动切换 {len(target_ids)} 个空间"
+                )
+
+                safe_log("本地 Chrome Workspace 导出: 尝试按 workspace_id 自动切换并导出")
+                for workspace_id in target_ids:
+                    if callable(cancel_check) and cancel_check():
+                        raise RuntimeError("任务已取消")
+                    last_error = ""
+                    try:
+                        for attempt in range(1, 5):
+                            try:
+                                value = page.evaluate(exchange_expression, workspace_id)
+                                if not dict(value or {}).get("ok"):
+                                    raise RuntimeError(f"session exchange HTTP {dict(value or {}).get('status')}")
+                                session = dict(value or {}).get("json")
+                                if not isinstance(session, dict):
+                                    raise RuntimeError("session exchange did not return JSON")
+                                cpa_json = convert_chatgpt_session_to_cpa_json(session)
+                                account_id = str(cpa_json.get("account_id") or "").strip()
+                                if not ChatGPTPlatform._workspace_id_matches_local(account_id, workspace_id):
+                                    raise RuntimeError(f"account_id mismatch: {account_id or '-'}")
+                                capture_cpa_json(
+                                    cpa_json,
+                                    matched_workspace=workspace_id,
+                                    account_id=account_id,
+                                    method="local_chrome_session_exchange_playwright",
+                                )
+                                last_error = ""
+                                break
+                            except Exception as exc:
+                                last_error = str(exc)
+                                if attempt < 4:
+                                    time.sleep(0.8)
+                        if last_error:
+                            raise RuntimeError(last_error)
+                    except Exception as exc:
+                        safe_log(
+                            "本地 Chrome Workspace 导出: "
+                            f"{workspace_id[:8]} 自动切换失败，保留监听兜底: {str(exc)[:120]}"
+                        )
+
+                last_seen = ""
+                deadline = time.monotonic() + max(int(timeout_sec), 1)
+                sleep_seconds = max(int(poll_ms), 100) / 1000
+                while time.monotonic() < deadline and target_set - captured_ids:
+                    if callable(cancel_check) and cancel_check():
+                        raise RuntimeError("任务已取消")
+                    try:
+                        value = page.evaluate(session_expression)
+                        session = dict(value or {}).get("json")
+                        if not isinstance(session, dict):
+                            raise RuntimeError(f"session API did not return JSON: HTTP {dict(value or {}).get('status')}")
+                        cpa_json = convert_chatgpt_session_to_cpa_json(session)
+                        account_id = str(cpa_json.get("account_id") or "").strip()
+                        matched_workspace = next(
+                            (
+                                workspace_id
+                                for workspace_id in target_ids
+                                if ChatGPTPlatform._workspace_id_matches_local(account_id, workspace_id)
+                            ),
+                            "",
+                        )
+                        if account_id and account_id != last_seen:
+                            last_seen = account_id
+                            safe_log(f"本地 Chrome Workspace 导出: 当前 session account_id={account_id[:8]}")
+                        if matched_workspace and matched_workspace not in captured_ids:
+                            capture_cpa_json(
+                                cpa_json,
+                                matched_workspace=matched_workspace,
+                                account_id=account_id,
+                                method="local_chrome_session_listener_playwright",
+                            )
+                    except Exception as exc:
+                        text = str(exc)
+                        if "missing accessToken" not in text and "session API did not return JSON" not in text:
+                            safe_log(f"本地 Chrome Workspace 导出: 本轮检测失败，继续监听: {text[:160]}")
+                    time.sleep(sleep_seconds)
+
+                missing = [workspace_id for workspace_id in target_ids if workspace_id not in captured_ids]
+                if missing:
+                    safe_log(f"本地 Chrome Workspace 导出: 超时/未捕获 {len(missing)} 个空间")
+                return {
+                    "captured": captured,
+                    "uploaded_count": sum(1 for item in captured if item.get("ok")),
+                    "missing_workspace_ids": missing,
+                    "cookies_injected": 0 if reused_existing_page else len(cookies or []),
+                    "cookies_skipped": 0,
+                }
+            finally:
+                browser.close()
+
+    @staticmethod
+    def _wait_local_chrome_chatgpt_ready(call, *, timeout_sec: int = 30, log=None) -> dict:
+        deadline = time.monotonic() + max(int(timeout_sec), 1)
+        last_value: dict = {}
+        expression = """
+        (async () => {
+          const href = String(location.href || "");
+          const readyState = String(document.readyState || "");
+          const host = String(location.hostname || "");
+          if (host !== "chatgpt.com") {
+            return { href, readyState, sessionOk: false, hasAccessToken: false, accountId: "" };
+          }
+          let text = "";
+          let json = {};
+          let sessionOk = false;
+          try {
+            const response = await fetch('/api/auth/session', {
+              method: "GET",
+              credentials: "include",
+              cache: "no-store",
+              headers: { accept: "*/*" },
+            });
+            sessionOk = response.ok;
+            text = await response.text().catch(() => "");
+            try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+          } catch (_) {}
+          const token = String(json?.accessToken || json?.access_token || json?.token?.accessToken || "");
+          let accountId = "";
+          try {
+            const payload = String(token.split(".")[1] || "");
+            const normalized = payload.replace(/-/g, "+").replace(/_/g, "/");
+            const padded = normalized + "=".repeat((4 - normalized.length % 4) % 4);
+            const data = JSON.parse(atob(padded));
+            accountId = String(data?.["https://api.openai.com/auth"]?.chatgpt_account_id || "");
+          } catch (_) {}
+          return {
+            href,
+            readyState,
+            sessionOk,
+            hasAccessToken: Boolean(token),
+            accountId,
+            text: token ? "" : text.slice(0, 80),
+          };
+        })()
+        """
+
+        while time.monotonic() <= deadline:
+            try:
+                evaluated = call(
+                    "Runtime.evaluate",
+                    {
+                        "expression": expression,
+                        "awaitPromise": True,
+                        "returnByValue": True,
+                    },
+                )
+                if evaluated.get("exceptionDetails"):
+                    raise RuntimeError("Runtime.evaluate exception")
+                value = dict(dict(evaluated.get("result") or {}).get("value") or {})
+                last_value = value
+                href = str(value.get("href") or "")
+                ready_state = str(value.get("readyState") or "")
+                if (
+                    "chatgpt.com" in href
+                    and ready_state != "loading"
+                    and value.get("sessionOk")
+                    and value.get("hasAccessToken")
+                ):
+                    account_id = str(value.get("accountId") or "")
+                    if callable(log):
+                        try:
+                            suffix = f" account_id={account_id[:8]}" if account_id else ""
+                            log(f"本地 Chrome Workspace 导出: ChatGPT session 已就绪{suffix}")
+                        except Exception:
+                            pass
+                    return value
+            except Exception as exc:
+                last_value = {"error": str(exc)}
+            time.sleep(0.25)
+        if callable(log):
+            try:
+                log(f"本地 Chrome Workspace 导出: 等待 ChatGPT session 就绪超时，继续尝试: {last_value}")
+            except Exception:
+                pass
+        return last_value
+
+    @staticmethod
+    def _open_host_chrome_via_cdp(*, cdp_url: str, url: str, cookies: list[dict]) -> dict:
+        import base64
+        import hashlib
+        import json as _json
+        import os
+        import socket
+        import struct
+        import urllib.parse
+        import urllib.request
+
+        base = str(cdp_url or "").rstrip("/")
+        create_url = f"{base}/json/new?{urllib.parse.quote('about:blank', safe='')}"
+        request = urllib.request.Request(create_url, method="PUT")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            target = _json.loads(response.read().decode("utf-8"))
+        ws_url = str(target.get("webSocketDebuggerUrl") or "")
+        if not ws_url:
+            raise RuntimeError("Chrome CDP did not return webSocketDebuggerUrl")
+
+        parsed = urllib.parse.urlparse(ws_url)
+        if parsed.scheme != "ws":
+            raise RuntimeError(f"unsupported CDP websocket scheme: {parsed.scheme}")
+        host = parsed.hostname or ""
+        port = parsed.port or 80
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+
+        sock = socket.create_connection((host, port), timeout=5)
+        try:
+            key = base64.b64encode(os.urandom(16)).decode("ascii")
+            handshake = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}:{port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n"
+                "\r\n"
+            )
+            sock.sendall(handshake.encode("ascii"))
+            header = b""
+            while b"\r\n\r\n" not in header:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                header += chunk
+                if len(header) > 16384:
+                    break
+            if b" 101 " not in header.split(b"\r\n", 1)[0]:
+                raise RuntimeError(f"CDP websocket handshake failed: {header[:200]!r}")
+            accept = ""
+            for line in header.decode("iso-8859-1", "replace").splitlines():
+                if line.lower().startswith("sec-websocket-accept:"):
+                    accept = line.split(":", 1)[1].strip()
+                    break
+            expected_accept = base64.b64encode(
+                hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
+            ).decode("ascii")
+            if accept and accept != expected_accept:
+                raise RuntimeError("CDP websocket accept key mismatch")
+
+            next_id = 0
+
+            def send_frame(payload: str) -> None:
+                raw = payload.encode("utf-8")
+                mask_key = os.urandom(4)
+                if len(raw) < 126:
+                    header_bytes = bytes([0x81, 0x80 | len(raw)])
+                elif len(raw) < 65536:
+                    header_bytes = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(raw))
+                else:
+                    header_bytes = bytes([0x81, 0x80 | 127]) + struct.pack("!Q", len(raw))
+                masked = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(raw))
+                sock.sendall(header_bytes + mask_key + masked)
+
+            def recv_exact(length: int) -> bytes:
+                data = b""
+                while len(data) < length:
+                    chunk = sock.recv(length - len(data))
+                    if not chunk:
+                        raise RuntimeError("CDP websocket closed")
+                    data += chunk
+                return data
+
+            def recv_frame() -> dict:
+                first = recv_exact(2)
+                opcode = first[0] & 0x0F
+                length = first[1] & 0x7F
+                masked = bool(first[1] & 0x80)
+                if length == 126:
+                    length = struct.unpack("!H", recv_exact(2))[0]
+                elif length == 127:
+                    length = struct.unpack("!Q", recv_exact(8))[0]
+                mask_key = recv_exact(4) if masked else b""
+                payload = recv_exact(length) if length else b""
+                if masked:
+                    payload = bytes(byte ^ mask_key[index % 4] for index, byte in enumerate(payload))
+                if opcode == 8:
+                    raise RuntimeError("CDP websocket closed by browser")
+                if opcode not in (1, 2):
+                    return {}
+                text = payload.decode("utf-8", "replace")
+                return _json.loads(text) if text else {}
+
+            def call(method: str, params: dict | None = None) -> dict:
+                nonlocal next_id
+                next_id += 1
+                message_id = next_id
+                send_frame(_json.dumps({"id": message_id, "method": method, "params": params or {}}))
+                while True:
+                    message = recv_frame()
+                    if message.get("id") != message_id:
+                        continue
+                    if message.get("error"):
+                        raise RuntimeError(f"{method} failed: {message['error']}")
+                    return dict(message.get("result") or {})
+
+            injected = 0
+            skipped = 0
+            try:
+                call("Network.enable", {})
+            except Exception:
+                pass
+            for origin in ChatGPTPlatform._local_chrome_state_clear_origins(url):
+                try:
+                    call(
+                        "Storage.clearDataForOrigin",
+                        {
+                            "origin": origin,
+                            "storageTypes": (
+                                "appcache,cookies,file_systems,indexeddb,local_storage,"
+                                "shader_cache,websql,service_workers,cache_storage"
+                            ),
+                        },
+                    )
+                except Exception:
+                    pass
+            for cookie in cookies or []:
+                try:
+                    call("Network.setCookies", {"cookies": [cookie]})
+                    injected += 1
+                except Exception:
+                    skipped += 1
+            call("Page.navigate", {"url": url})
+            try:
+                call("Page.bringToFront", {})
+            except Exception:
+                pass
+            return {"cookies_injected": injected, "cookies_skipped": skipped}
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _local_chrome_state_clear_origins(url: str = "") -> list[str]:
+        origins = [
+            "https://chatgpt.com",
+            "https://auth.openai.com",
+            "https://openai.com",
+        ]
+        try:
+            import urllib.parse
+
+            parsed = urllib.parse.urlparse(str(url or ""))
+            if parsed.scheme == "https" and parsed.hostname:
+                current = f"{parsed.scheme}://{parsed.hostname}"
+                if current.endswith(".openai.com") or current in {"https://chatgpt.com", "https://openai.com"}:
+                    origins.insert(0, current)
+        except Exception:
+            pass
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for origin in origins:
+            if origin not in seen:
+                seen.add(origin)
+                deduped.append(origin)
+        return deduped
+
+    @staticmethod
+    def _default_host_chrome_cdp_url() -> str:
+        import socket
+
+        try:
+            host_ip = socket.gethostbyname("host.docker.internal")
+            if host_ip:
+                return f"http://{host_ip}:9222"
+        except Exception:
+            pass
+        return "http://127.0.0.1:9222"
+
+    @staticmethod
+    def _normalize_local_chrome_cookie_list(cookies: list, *, domain: str) -> list[dict]:
+        normalized: list[dict] = []
+        origin = f"https://{domain}"
+        for raw in cookies or []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name or any(ch in name for ch in "\r\n\t ;="):
+                continue
+            value = str(raw.get("value") or "")
+            cookie = {
+                "name": name,
+                "value": value,
+                "path": str(raw.get("path") or "/") or "/",
+            }
+            if name.startswith("__Host-"):
+                cookie["url"] = origin
+                cookie["secure"] = True
+                cookie["path"] = "/"
+            else:
+                cookie["domain"] = str(raw.get("domain") or domain).strip() or domain
+                if name.startswith("__Secure-"):
+                    cookie["secure"] = True
+                elif "secure" in raw:
+                    cookie["secure"] = bool(raw.get("secure"))
+            if "httpOnly" in raw:
+                cookie["httpOnly"] = bool(raw.get("httpOnly"))
+            same_site = str(raw.get("sameSite") or "").strip()
+            if same_site in {"Strict", "Lax", "None"}:
+                cookie["sameSite"] = same_site
+                if same_site == "None":
+                    cookie["secure"] = True
+            expires = raw.get("expires")
+            if isinstance(expires, (int, float)) and expires > 0:
+                cookie["expires"] = expires
+            normalized.append(cookie)
+        return normalized
+
+    @staticmethod
+    def _normalize_local_chrome_cookies_for_playwright(
+        cookies: list,
+        *,
+        default_domain: str = "chatgpt.com",
+    ) -> list[dict]:
+        normalized: list[dict] = []
+        allowed = {"name", "value", "url", "domain", "path", "expires", "httpOnly", "secure", "sameSite"}
+        default_url = f"https://{str(default_domain or 'chatgpt.com').lstrip('.')}/"
+        for raw in cookies or []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if not name or any(ch in name for ch in "\r\n\t ;="):
+                continue
+            item = {
+                key: value
+                for key, value in raw.items()
+                if key in allowed and value is not None and value != ""
+            }
+            item["name"] = name
+            item["value"] = str(raw.get("value") or "")
+            if item.get("url"):
+                item["url"] = str(item["url"])
+                item.pop("domain", None)
+                item.pop("path", None)
+            else:
+                domain = str(item.get("domain") or "").strip()
+                path = str(item.get("path") or "").strip()
+                if domain:
+                    item["domain"] = domain
+                    item["path"] = path or "/"
+                else:
+                    item.pop("domain", None)
+                    item.pop("path", None)
+                    item["url"] = default_url
+            same_site = str(item.get("sameSite") or "").strip()
+            if same_site:
+                if same_site not in {"Strict", "Lax", "None"}:
+                    item.pop("sameSite", None)
+                elif same_site == "None":
+                    item["secure"] = True
+            expires = item.get("expires")
+            if expires is not None and not isinstance(expires, (int, float)):
+                item.pop("expires", None)
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _filter_local_chrome_cookies_for_domain(cookies: list, *, domain: str) -> list[dict]:
+        """Keep only cookies needed to reopen a ChatGPT session in host Chrome.
+
+        Saved browser cookie strings often contain analytics and stale cookies from
+        several OpenAI surfaces. Injecting the whole set into ``chatgpt.com`` can
+        exceed Chrome/server request-header limits and produce HTTP 431.
+        """
+        exact_allowed = {
+            "__Host-next-auth.csrf-token",
+            "__Secure-next-auth.callback-url",
+            "_cfuvid",
+            "cf_clearance",
+            "oai-did",
+            "oai-sc",
+            "oaicom-stable-id",
+        }
+        prefix_allowed = (
+            "__Secure-next-auth.session-token",
+        )
+        normalized_domain = str(domain or "").lstrip(".").lower()
+        filtered: list[dict] = []
+        seen: set[tuple[str, str, str]] = set()
+        for raw in cookies or []:
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "").strip()
+            if name not in exact_allowed and not any(
+                name == prefix or name.startswith(prefix + ".")
+                for prefix in prefix_allowed
+            ):
+                continue
+            value = str(raw.get("value") or "")
+            if not value:
+                continue
+            raw_domain = str(raw.get("domain") or normalized_domain).lstrip(".").lower()
+            if normalized_domain and raw_domain and not (
+                raw_domain == normalized_domain
+                or raw_domain.endswith("." + normalized_domain)
+                or normalized_domain.endswith("." + raw_domain)
+            ):
+                continue
+            path = str(raw.get("path") or "/") or "/"
+            key = (name, raw_domain or normalized_domain, path)
+            if key in seen:
+                continue
+            seen.add(key)
+            filtered.append(raw)
+        return filtered
+
     def _handle_query_state(self, account: Account, params: dict) -> dict:
         """Handle query_state capability for ChatGPT."""
         proxy = self.config.proxy if self.config else None

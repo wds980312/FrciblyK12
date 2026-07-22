@@ -14,4 +14,5 @@ services:
       # - VNC_PASSWORD=changeme
     volumes:
       - ./data:/app/data   # 持久化 SQLite 数据库
+      - ./data/camoufox:/root/.cache/camoufox   # 持久化 Camoufox 浏览器缓存
     restart: unless-stopped

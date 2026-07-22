@@ -68,6 +68,12 @@ def _render_dict(template: dict | None, variables: dict) -> dict:
     return result
 
 
+def _body_field_value(data: dict, field: str):
+    if "." in field:
+        return _deep_get(data, field)
+    return data.get(field)
+
+
 # ---------------------------------------------------------------------------
 # 通用 HTTP 邮箱驱动
 # ---------------------------------------------------------------------------
@@ -385,12 +391,17 @@ class GenericHttpMailbox(BaseMailbox):
 
                     text_parts = []
                     for field in body_fields:
-                        val = detail_data.get(field)
+                        val = _body_field_value(detail_data, field)
                         if val:
                             text_parts.append(str(val))
 
                     # 也检查特殊字段
-                    code_val = detail_data.get("verification_code")
+                    code_val = (
+                        detail_data.get("verification_code")
+                        or detail_data.get("verificationCode")
+                        or _deep_get(detail_data, "data.verificationCode")
+                        or _deep_get(detail_data, "data.verification_code")
+                    )
                     if code_val and str(code_val) != "None":
                         return str(code_val)
 
@@ -457,7 +468,7 @@ class GenericHttpMailbox(BaseMailbox):
 
                     text_parts = []
                     for field in body_fields:
-                        val = detail_data.get(field)
+                        val = _body_field_value(detail_data, field)
                         if val:
                             text_parts.append(str(val))
 

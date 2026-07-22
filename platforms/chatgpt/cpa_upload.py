@@ -209,6 +209,7 @@ def upload_to_cpa(
     api_url: str = None,
     api_key: str = None,
     proxy: str = None,
+    filename: str | None = None,
 ) -> Tuple[bool, str]:
     """上传单个账号到 CPA 管理平台（不走代理）。"""
     if not api_url:
@@ -223,7 +224,7 @@ def upload_to_cpa(
         return False, "account_id 为空，无法上传 CPA（JWT 和所有 fallback 均未获取到）"
 
     upload_url = f"{api_url.rstrip('/')}/v0/management/auth-files"
-    filename = f"{token_data['email']}.json"
+    filename = str(filename or "").strip() or f"{token_data['email']}.json"
     file_content = json.dumps(token_data, ensure_ascii=False, separators=(",", ":"))
     headers = {
         "Authorization": f"Bearer {api_key or ''}",

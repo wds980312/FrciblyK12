@@ -15,6 +15,7 @@ DEFAULT_LAOUDO_API_URL = "https://laoudo.com/api/email"
 DEFAULT_AITRE_API_URL = "https://mail.aitre.cc/api/tempmail"
 DEFAULT_TEMPMAIL_LOL_API_URL = "https://api.tempmail.lol/v2"
 DEFAULT_TEMPMAIL_WEB_BASE_URL = "https://web2.temp-mail.org"
+DEFAULT_SMSBOWER_API_URL = "https://smsbower.app"
 
 
 @dataclass
@@ -46,6 +47,10 @@ class BaseMailbox(ABC):
                       timeout: int = 120, before_ids: set = None) -> str:
         """等待并返回验证链接。默认由具体 provider 自行实现。"""
         raise NotImplementedError(f"{self.__class__.__name__} 暂不支持 wait_for_link()")
+
+    def release(self, account: MailboxAccount, reason: str = "") -> bool:
+        """释放未完成注册的邮箱资源。默认 provider 无需处理。"""
+        return False
 
 
 class FallbackMailbox(BaseMailbox):
@@ -88,6 +93,8 @@ class FallbackMailbox(BaseMailbox):
                 return account
             except Exception as exc:
                 message = str(exc).strip() or exc.__class__.__name__
+                if message == "任务已取消":
+                    raise
                 errors.append(f"{provider_key}: {message}")
                 print(f"[Mailbox] provider 失败: {provider_key} -> {message}")
                 continue
@@ -115,6 +122,9 @@ class FallbackMailbox(BaseMailbox):
             timeout=timeout,
             before_ids=before_ids,
         )
+
+    def release(self, account: MailboxAccount, reason: str = "") -> bool:
+        return self._resolve_mailbox(account).release(account, reason=reason)
 
 
 def _extract_verification_link(text: str, keyword: str = "") -> str | None:
@@ -166,6 +176,25 @@ def _create_tempmail(extra: dict, proxy: str | None) -> 'BaseMailbox':
 def _create_tempmail_web(extra: dict, proxy: str | None) -> 'BaseMailbox':
     return TempMailWebMailbox(
         base_url=extra.get("tempmail_web_base_url", ""),
+        proxy=proxy,
+    )
+
+
+def _create_smsbower_mail(extra: dict, proxy: str | None) -> 'BaseMailbox':
+    return SmsBowerMailMailbox(
+        api_key=extra.get("smsbower_mail_api_key", ""),
+        service=extra.get("smsbower_mail_service", ""),
+        domain=extra.get("smsbower_mail_domain", ""),
+        max_price=extra.get("smsbower_mail_max_price", ""),
+        alias=extra.get("smsbower_mail_alias", ""),
+        reuse_limit=extra.get("smsbower_mail_reuse_limit", ""),
+        activation_limit=extra.get("smsbower_mail_activation_limit", ""),
+        alias_prefix=extra.get("smsbower_mail_alias_prefix", ""),
+        manual_activations=extra.get("smsbower_mail_manual_activations", ""),
+        activation_wait_seconds=extra.get("smsbower_mail_activation_wait_seconds", ""),
+        activation_poll_interval=extra.get("smsbower_mail_activation_poll_interval", ""),
+        api_url=extra.get("smsbower_mail_api_url", ""),
+        cancel_check=extra.get("_cancel_check"),
         proxy=proxy,
     )
 
@@ -291,6 +320,7 @@ MAILBOX_FACTORY_REGISTRY = {
     "generic_http_mailbox": _create_generic_http,
     "tempmail_lol_api": _create_tempmail,
     "tempmail_web_api": _create_tempmail_web,
+    "smsbower_mail_api": _create_smsbower_mail,
     "duckmail_api": _create_duckmail,
     "ddg_email": _create_ddg_email,
     "ddg_email_api": _create_ddg_email,
@@ -305,6 +335,7 @@ MAILBOX_FACTORY_REGISTRY = {
     "generic_http": _create_generic_http,
     "tempmail_lol": _create_tempmail,
     "tempmail_web": _create_tempmail_web,
+    "smsbower_mail": _create_smsbower_mail,
     "duckmail": _create_duckmail,
     "freemail": _create_freemail,
     "moemail": _create_moemail,
@@ -686,6 +717,415 @@ class TempMailLolMailbox(BaseMailbox):
             except Exception:
                 pass
             time.sleep(3)
+        raise TimeoutError(f"等待验证链接超时 ({timeout}s)")
+
+
+class SmsBowerMailMailbox(BaseMailbox):
+    """SMSBower 临时邮箱 API provider."""
+
+    def __init__(
+        self,
+        api_key: str,
+        *,
+        service: str = "",
+        domain: str = "",
+        max_price: str | float | int = "",
+        alias: str | bool = "",
+        reuse_limit: str | int = "",
+        activation_limit: str | int = "",
+        alias_prefix: str = "",
+        manual_activations: str | list | tuple = "",
+        activation_wait_seconds: str | int | float = "",
+        activation_poll_interval: str | int | float = "",
+        api_url: str = "",
+        cancel_check=None,
+        proxy: str = None,
+    ):
+        import threading
+
+        self.api_key = str(api_key or "").strip()
+        self.api = _normalize_api_base_url(
+            api_url,
+            default=DEFAULT_SMSBOWER_API_URL,
+            label="SMSBower Mail API",
+        )
+        self.service = str(service or "go").strip()
+        self.domain = str(domain or "gmail.com").strip()
+        self.max_price = str(max_price or "").strip()
+        alias_raw = alias if isinstance(alias, bool) else str(alias or "").strip().lower()
+        self.alias = "1" if alias_raw in (True, "1", "true", "yes", "on", "是") else ""
+        try:
+            parsed_reuse_limit = int(str(reuse_limit or "").strip() or "0")
+        except ValueError:
+            parsed_reuse_limit = 0
+        self.reuse_limit = max(parsed_reuse_limit or (5 if self.alias else 1), 1)
+        try:
+            parsed_activation_limit = int(str(activation_limit or "").strip() or "0")
+        except ValueError:
+            parsed_activation_limit = 0
+        self.activation_limit = max(parsed_activation_limit, 0)
+        self.alias_prefix = re.sub(r"[^a-zA-Z0-9_-]+", "", str(alias_prefix or "gpt").strip()) or "gpt"
+        self.activation_wait_seconds = max(self._parse_float(activation_wait_seconds, 0.0), 0.0)
+        self.activation_poll_interval = max(self._parse_float(activation_poll_interval, 3.0), 0.5)
+        self.cancel_check = cancel_check if callable(cancel_check) else None
+        self._manual_activation_raw = manual_activations
+        self._manual_activation_seed = self._parse_manual_activations(manual_activations)
+        self.proxy = {"http": proxy, "https": proxy} if proxy else None
+        self._released_mail_ids: set[str] = set()
+        self._lock = threading.RLock()
+        self._active_activation: dict | None = None
+        self._activations: dict[str, dict] = {}
+        self._mail_locks: dict[str, threading.RLock] = {}
+        self._created_activation_count = 0
+
+    @staticmethod
+    def _ok(value) -> bool:
+        return value in (1, "1", True, "success", "SUCCESS", "ok", "OK")
+
+    @staticmethod
+    def _parse_float(value, default: float) -> float:
+        try:
+            raw = str(value or "").strip()
+            return float(raw) if raw else float(default)
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _parse_manual_activations(value) -> list[dict]:
+        if isinstance(value, str):
+            lines = value.splitlines()
+        elif isinstance(value, (list, tuple, set)):
+            lines = list(value)
+        else:
+            lines = []
+
+        activations: list[dict] = []
+        for line in lines:
+            raw = str(line or "").strip()
+            if not raw:
+                continue
+            if "----" in raw:
+                email, mail_id = raw.split("----", 1)
+            elif "|" in raw:
+                email, mail_id = raw.split("|", 1)
+            elif "," in raw:
+                email, mail_id = raw.split(",", 1)
+            else:
+                continue
+            email = email.strip()
+            mail_id = mail_id.strip()
+            if email and mail_id:
+                activations.append({"base_email": email, "mail_id": mail_id})
+        return activations
+
+    @staticmethod
+    def _has_manual_activation_input(value) -> bool:
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, (list, tuple, set)):
+            return any(str(item or "").strip() for item in value)
+        return False
+
+    def _request(self, path: str, params: dict, *, timeout: int = 20) -> dict:
+        import requests
+
+        if not self.api_key:
+            raise RuntimeError("SMSBower Mail 未配置 API Key")
+        payload = {"api_key": self.api_key, **params}
+        resp = requests.get(
+            f"{self.api}{path}",
+            params=payload,
+            timeout=timeout,
+            proxies=self.proxy,
+        )
+        resp.raise_for_status()
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise RuntimeError(f"SMSBower Mail 返回非 JSON: {resp.text[:200]}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(f"SMSBower Mail 返回格式异常: {str(data)[:200]}")
+        return data
+
+    def _raise_if_cancelled(self) -> None:
+        if callable(self.cancel_check) and self.cancel_check():
+            raise RuntimeError("任务已取消")
+
+    def _set_status(self, mail_id: str, status: int) -> bool:
+        if not mail_id:
+            return False
+        try:
+            data = self._request(
+                "/api/mail/setStatus",
+                {"id": str(mail_id), "status": int(status)},
+                timeout=15,
+            )
+            return self._ok(data.get("status"))
+        except Exception:
+            return False
+
+    def _mail_lock(self, mail_id: str):
+        with self._lock:
+            lock = self._mail_locks.get(mail_id)
+            if lock is None:
+                import threading
+
+                lock = threading.RLock()
+                self._mail_locks[mail_id] = lock
+            return lock
+
+    @staticmethod
+    def _gmail_alias(base_email: str, tag: str) -> str:
+        local, sep, domain = str(base_email or "").strip().partition("@")
+        if not sep:
+            return base_email
+        local = local.split("+", 1)[0]
+        return f"{local}+{tag}@{domain}"
+
+    def _build_account_from_activation(self, activation: dict, alias_index: int) -> MailboxAccount:
+        base_email = str(activation.get("base_email") or "").strip()
+        mail_id = str(activation.get("mail_id") or "").strip()
+        email = base_email
+        if self.alias and self.reuse_limit > 1:
+            email = self._gmail_alias(base_email, f"{self.alias_prefix}{alias_index:02d}")
+        return MailboxAccount(
+            email=email,
+            account_id=mail_id,
+            extra={
+                "provider_resource": {
+                    "provider_type": "mailbox",
+                    "provider_name": "smsbower_mail",
+                    "resource_type": "mailbox",
+                    "resource_identifier": mail_id,
+                    "handle": email,
+                    "display_name": email,
+                    "metadata": {
+                        "email": email,
+                        "base_email": base_email,
+                        "mail_id": mail_id,
+                        "service": self.service,
+                        "domain": self.domain,
+                        "alias_index": alias_index,
+                        "reuse_limit": self.reuse_limit,
+                    },
+                },
+            },
+        )
+
+    def _register_activation(self, mail: str, mail_id: str) -> MailboxAccount:
+        with self._lock:
+            activation = {
+                "base_email": str(mail or "").strip(),
+                "mail_id": str(mail_id or "").strip(),
+                "assigned": 1,
+                "completed": 0,
+                "reuse_limit": self.reuse_limit,
+                "closed": False,
+            }
+            self._activations[activation["mail_id"]] = activation
+            self._active_activation = activation if self.reuse_limit > 1 else None
+            self._created_activation_count += 1
+            return self._build_account_from_activation(activation, 1)
+
+    def _mark_code_accepted(self, mail_id: str) -> None:
+        with self._lock:
+            activation = self._activations.get(mail_id)
+            if not activation:
+                status = 3
+            else:
+                activation["completed"] = int(activation.get("completed") or 0) + 1
+                completed = int(activation.get("completed") or 0)
+                limit = int(activation.get("reuse_limit") or self.reuse_limit)
+                status = 3 if completed >= limit else 5
+                if status == 3:
+                    activation["closed"] = True
+                    if self._active_activation is activation:
+                        self._active_activation = None
+        ok = self._set_status(mail_id, status)
+        if status == 5 and not ok:
+            with self._lock:
+                activation = self._activations.get(mail_id)
+                if activation:
+                    activation["closed"] = True
+                    activation["next_code_failed"] = True
+                    if self._active_activation is activation:
+                        self._active_activation = None
+
+    def _cancel_activation(self, mail_id: str) -> None:
+        with self._lock:
+            activation = self._activations.get(mail_id)
+            if activation:
+                activation["closed"] = True
+                if self._active_activation is activation:
+                    self._active_activation = None
+        self._set_status(mail_id, 2)
+
+    def get_email(self) -> MailboxAccount:
+        with self._lock:
+            activation = self._active_activation
+            if (
+                activation
+                and not activation.get("closed")
+                and int(activation.get("assigned") or 0) < int(activation.get("reuse_limit") or self.reuse_limit)
+                and int(activation.get("assigned") or 0) <= int(activation.get("completed") or 0)
+            ):
+                activation["assigned"] = int(activation.get("assigned") or 0) + 1
+                return self._build_account_from_activation(activation, int(activation["assigned"]))
+            if self.activation_limit and self._created_activation_count >= self.activation_limit:
+                raise RuntimeError(
+                    f"SMSBower Mail activation 已达本任务上限: "
+                    f"{self._created_activation_count}/{self.activation_limit}"
+                )
+            if self._manual_activation_seed:
+                manual_activation = self._manual_activation_seed.pop(0)
+                return self._register_activation(
+                    manual_activation["base_email"],
+                    manual_activation["mail_id"],
+                )
+            if self._has_manual_activation_input(self._manual_activation_raw):
+                raise RuntimeError("SMSBower Mail 手动邮箱 activation 格式错误，请填写: email@gmail.com----mailId")
+
+        params = {
+            "service": self.service,
+            "domain": self.domain,
+        }
+        if self.max_price:
+            params["maxPrice"] = self.max_price
+        if self.alias:
+            params["alias"] = self.alias
+
+        import time
+
+        deadline = time.time() + self.activation_wait_seconds if self.activation_wait_seconds > 0 else None
+        last_error: object = None
+        while True:
+            self._raise_if_cancelled()
+            try:
+                data = self._request("/api/mail/getActivation", params)
+            except Exception as exc:
+                last_error = exc
+            else:
+                mail = str(data.get("mail") or data.get("email") or "").strip()
+                mail_id = str(data.get("mailId") or data.get("id") or "").strip()
+                if self._ok(data.get("status")) and mail and mail_id:
+                    return self._register_activation(mail, mail_id)
+                last_error = data
+
+            if deadline is not None and time.time() >= deadline:
+                break
+            sleep_until = time.time() + self.activation_poll_interval
+            while time.time() < sleep_until:
+                self._raise_if_cancelled()
+                time.sleep(min(0.5, max(sleep_until - time.time(), 0)))
+
+        raise RuntimeError(f"SMSBower Mail 获取邮箱失败: {str(last_error)[:300]}")
+
+    def get_current_ids(self, account: MailboxAccount) -> set:
+        mail_id = str(getattr(account, "account_id", "") or "").strip()
+        return {mail_id} if mail_id else set()
+
+    def release(self, account: MailboxAccount, reason: str = "") -> bool:
+        mail_id = str(getattr(account, "account_id", "") or "").strip()
+        if not mail_id:
+            return False
+        if mail_id in self._released_mail_ids:
+            return True
+        self._cancel_activation(mail_id)
+        ok = True
+        if ok:
+            self._released_mail_ids.add(mail_id)
+        return ok
+
+    def wait_for_code(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+        code_pattern: str = None,
+    ) -> str:
+        import re
+        import time
+
+        mail_id = str(getattr(account, "account_id", "") or "").strip()
+        if not mail_id:
+            raise RuntimeError("SMSBower Mail 缺少 mailId")
+
+        lock = self._mail_lock(mail_id)
+        with lock:
+            pattern = code_pattern or r'(?<!#)(?<!\d)(\d{6})(?!\d)'
+            deadline = time.time() + max(int(timeout or 0), 0)
+            while time.time() < deadline:
+                try:
+                    data = self._request("/api/mail/getCode", {"mailId": mail_id}, timeout=15)
+                except Exception:
+                    time.sleep(3)
+                    continue
+                code_text = str(data.get("code") or data.get("sms") or data.get("text") or "").strip()
+                if self._ok(data.get("status")) and code_text:
+                    if keyword and keyword.lower() not in code_text.lower():
+                        time.sleep(3)
+                        continue
+                    match = re.search(pattern, code_text)
+                    code = match.group(1) if match and match.groups() else (match.group(0) if match else code_text)
+                    self._mark_code_accepted(mail_id)
+                    return code
+                message = str(data.get("message") or data.get("error") or data).lower()
+                if "maximum number of codes" in message or "max" in message and "code" in message:
+                    with self._lock:
+                        activation = self._activations.get(mail_id)
+                        if activation:
+                            activation["closed"] = True
+                            activation["max_codes_reached"] = True
+                            if self._active_activation is activation:
+                                self._active_activation = None
+                    raise RuntimeError(f"SMSBower Mail 已达到继续取码上限: {str(data)[:300]}")
+                time.sleep(3)
+
+        self._cancel_activation(mail_id)
+        raise TimeoutError(f"等待验证码超时 ({timeout}s)")
+
+    def wait_for_link(
+        self,
+        account: MailboxAccount,
+        keyword: str = "",
+        timeout: int = 120,
+        before_ids: set = None,
+    ) -> str:
+        import time
+
+        mail_id = str(getattr(account, "account_id", "") or "").strip()
+        if not mail_id:
+            raise RuntimeError("SMSBower Mail 缺少 mailId")
+
+        lock = self._mail_lock(mail_id)
+        with lock:
+            deadline = time.time() + max(int(timeout or 0), 0)
+            while time.time() < deadline:
+                try:
+                    data = self._request("/api/mail/getCode", {"mailId": mail_id}, timeout=15)
+                except Exception:
+                    time.sleep(3)
+                    continue
+                text = str(data.get("code") or data.get("sms") or data.get("text") or "").strip()
+                if self._ok(data.get("status")) and text:
+                    link = _extract_verification_link(text, keyword)
+                    if link:
+                        self._mark_code_accepted(mail_id)
+                        return link
+                message = str(data.get("message") or data.get("error") or data).lower()
+                if "maximum number of codes" in message or "max" in message and "code" in message:
+                    with self._lock:
+                        activation = self._activations.get(mail_id)
+                        if activation:
+                            activation["closed"] = True
+                            activation["max_codes_reached"] = True
+                            if self._active_activation is activation:
+                                self._active_activation = None
+                    raise RuntimeError(f"SMSBower Mail 已达到继续取码上限: {str(data)[:300]}")
+                time.sleep(3)
+
+        self._cancel_activation(mail_id)
         raise TimeoutError(f"等待验证链接超时 ({timeout}s)")
 
 

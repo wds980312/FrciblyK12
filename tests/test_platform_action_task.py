@@ -76,6 +76,100 @@ def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
     assert logger.finished == (tasks_module.TASK_STATUS_SUCCEEDED, "")
 
 
+def test_auto_upload_cpa_uploads_workspace_export_files(monkeypatch, tmp_path):
+    from core.config_store import config_store
+
+    uploads = []
+
+    export_one = tmp_path / "workspace-one.json"
+    export_two = tmp_path / "workspace-two.json"
+    export_one.write_text('{"email":"one@example.com","account_id":"workspace-one"}', encoding="utf-8")
+    export_two.write_text('{"email":"two@example.com","account_id":"workspace-two"}', encoding="utf-8")
+
+    monkeypatch.setattr(config_store, "get", lambda key, default="": "http://cpa.example" if key == "cpa_api_url" else default)
+
+    def fake_upload_to_cpa(token_data, **kwargs):
+        uploads.append((token_data, kwargs))
+        return True, "uploaded"
+
+    monkeypatch.setattr("platforms.chatgpt.cpa_upload.upload_to_cpa", fake_upload_to_cpa)
+    logger = _FakeLogger()
+
+    tasks_module._auto_upload_cpa(
+        logger,
+        Account(
+            platform="chatgpt",
+            email="member@example.com",
+            password="Secret123!",
+            extra={
+                "workspace_join": {
+                    "cpa_exports": [
+                        {"path": str(export_one), "workspace_id": "workspace-one"},
+                        {"path": str(export_two), "workspace_id": "secondws-two"},
+                    ]
+                }
+            },
+        ),
+    )
+
+    assert uploads == [
+        (
+            {"email": "one@example.com", "account_id": "workspace-one"},
+            {"filename": "one@example.com-workspac.json"},
+        ),
+        (
+            {"email": "two@example.com", "account_id": "workspace-two"},
+            {"filename": "two@example.com-secondws.json"},
+        ),
+    ]
+    assert any("[CPA:workspac] ✓ uploaded" in str(event[1]) for event in logger.events)
+
+
+def test_auto_upload_cpa_does_not_fallback_after_workspace_export_attempt(monkeypatch, tmp_path):
+    from core.config_store import config_store
+
+    uploads = []
+    export_one = tmp_path / "workspace-one.json"
+    export_one.write_text('{"email":"one@example.com","account_id":"workspace-one"}', encoding="utf-8")
+
+    monkeypatch.setattr(config_store, "get", lambda key, default="": "http://cpa.example" if key == "cpa_api_url" else default)
+    monkeypatch.setattr(
+        "platforms.chatgpt.cpa_upload.generate_token_json",
+        lambda _account: {"email": "fallback@example.com", "account_id": "personal"},
+    )
+
+    def fake_upload_to_cpa(token_data, **kwargs):
+        uploads.append((token_data, kwargs))
+        return False, "duplicate"
+
+    monkeypatch.setattr("platforms.chatgpt.cpa_upload.upload_to_cpa", fake_upload_to_cpa)
+    logger = _FakeLogger()
+
+    tasks_module._auto_upload_cpa(
+        logger,
+        Account(
+            platform="chatgpt",
+            email="member@example.com",
+            password="Secret123!",
+            token="personal-access",
+            extra={
+                "workspace_join": {
+                    "cpa_exports": [
+                        {"path": str(export_one), "workspace_id": "workspace-one"},
+                    ]
+                }
+            },
+        ),
+    )
+
+    assert uploads == [
+        (
+            {"email": "one@example.com", "account_id": "workspace-one"},
+            {"filename": "one@example.com-workspac.json"},
+        )
+    ]
+
+
 def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatch):
     class FakePlatform:
         def register(self, email=None, password=None):
@@ -181,6 +275,120 @@ def test_chatgpt_register_task_fails_when_workspace_join_fails(monkeypatch):
         "Workspace Join 失败: invite button not clicked",
     )
     assert not any(event[0] == "success" for event in logger.events)
+
+
+def test_chatgpt_register_task_succeeds_when_workspace_export_is_partial(monkeypatch):
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={
+                    "access_token": "access-token",
+                    "workspace_join": {
+                        "ok": True,
+                        "export_partial_error": "Workspace Join switch/export partial failed: workspace-one failed",
+                        "cpa_exports": [
+                            {"workspace_id": "workspace-two", "path": "/tmp/workspace-two.json"},
+                        ],
+                    },
+                },
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda *args, **kwargs: None)
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "auto_chatgpt_workspace_join": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert logger.finished[0] == tasks_module.TASK_STATUS_SUCCEEDED
+    assert any(event[0] == "success" for event in logger.events)
+
+
+def test_chatgpt_register_task_uploads_partial_workspace_exports_before_success(monkeypatch):
+    exported = {"workspace_id": "workspace-two", "path": "/tmp/workspace-two.json"}
+    uploaded = []
+
+    class FakePlatform:
+        def register(self, email=None, password=None):
+            return Account(
+                platform="chatgpt",
+                email=email or "registered@example.com",
+                password=password or "Secret123!",
+                user_id="acct_123",
+                extra={
+                    "access_token": "access-token",
+                    "workspace_join": {
+                        "ok": True,
+                        "export_partial_error": "Workspace Join switch/export partial failed: workspace-one failed",
+                        "cpa_exports": [exported],
+                    },
+                },
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda *args, **kwargs: FakePlatform(),
+    )
+    monkeypatch.setattr(tasks_module, "_auto_upload_cpa", lambda logger, account: uploaded.append(account.email))
+    monkeypatch.setattr(tasks_module, "_auto_push_any2api", lambda *args, **kwargs: None)
+
+    logger = _FakeLogger()
+
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 1,
+            "concurrency": 1,
+            "email": "registered@example.com",
+            "password": "Secret123!",
+            "extra": {
+                "identity_provider": "oauth_browser",
+                "auto_chatgpt_workspace_join": True,
+                "auto_chatgpt_plus_payment": False,
+            },
+        },
+        logger,
+    )
+
+    assert uploaded == ["registered@example.com"]
+    assert logger.finished[0] == tasks_module.TASK_STATUS_SUCCEEDED
+    assert any(event[0] == "success" for event in logger.events)
 
 
 def test_phone_bind_task_passes_logger_and_browser_mode(monkeypatch):
@@ -887,3 +1095,74 @@ def test_platform_runtime_persists_get_rt_tokens_and_user_info(monkeypatch):
     assert summary["codex_oauth"]["account_id"] == "acct-123"
     assert summary["codex_oauth"]["profile"]["name"] == "Real User"
     assert summary["codex_oauth"]["id_token_claims"]["sub"] == "auth0|abc"
+
+
+def test_platform_runtime_persists_workspace_join_action_data(monkeypatch):
+    patched = {}
+
+    class FakeSession:
+        def __init__(self, engine):
+            self.added = []
+            self.committed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def get(self, model_cls, account_id):
+            return type("Model", (), {"id": account_id, "platform": "chatgpt", "updated_at": None})()
+
+        def add(self, model):
+            self.added.append(model)
+
+        def commit(self):
+            self.committed = True
+
+    class FakePlatform:
+        def __init__(self, config=None):
+            pass
+
+        def execute_action(self, action_id, account, params):
+            return {
+                "ok": True,
+                "data": {
+                    "message": "workspace CPA exported: 1/1",
+                    "workspace_id": "workspace-1",
+                    "workspace_join": {
+                        "ok": True,
+                        "workspace_ids": ["workspace-1"],
+                        "cpa_exports": [
+                            {
+                                "ok": True,
+                                "path": "/tmp/workspace-1.json",
+                                "workspace_id": "workspace-1",
+                                "account_id": "workspace-1-account",
+                            }
+                        ],
+                    },
+                },
+            }
+
+    def fake_patch_account_graph(session, model, **kwargs):
+        patched.update(kwargs)
+
+    monkeypatch.setattr(runtime_module, "Session", FakeSession)
+    monkeypatch.setattr(runtime_module, "load_all", lambda: None)
+    monkeypatch.setattr(runtime_module, "get", lambda platform: FakePlatform)
+    monkeypatch.setattr(runtime_module, "build_platform_account", lambda session, model: object())
+    monkeypatch.setattr(runtime_module, "patch_account_graph", fake_patch_account_graph)
+
+    result = runtime_module.PlatformRuntime().execute_action(
+        ActionExecutionCommand(
+            platform="chatgpt",
+            account_id=123,
+            action_id="retry_workspace_export",
+            params={},
+        )
+    )
+
+    assert result.ok is True
+    assert patched["credential_updates"]["workspace_id"] == "workspace-1"
+    assert patched["credential_updates"]["workspace_join"]["cpa_exports"][0]["path"] == "/tmp/workspace-1.json"

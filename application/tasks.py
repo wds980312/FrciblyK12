@@ -619,18 +619,47 @@ def _auto_upload_cpa(task_logger: TaskLogger, account) -> None:
         if cpa_url:
             from platforms.chatgpt.cpa_upload import generate_token_json, upload_to_cpa
 
+            extra = account.extra or {}
+            workspace_join = extra.get("workspace_join") if isinstance(extra, dict) else {}
+            cpa_exports = []
+            if isinstance(workspace_join, dict):
+                cpa_exports = [item for item in workspace_join.get("cpa_exports") or [] if isinstance(item, dict)]
+
+            uploaded_paths: set[str] = set()
+            for item in cpa_exports:
+                path = str(item.get("path") or "").strip()
+                if not path or path in uploaded_paths:
+                    continue
+                uploaded_paths.add(path)
+                try:
+                    with open(path, "r", encoding="utf-8") as fh:
+                        token_data = json.load(fh)
+                    workspace_label = str(item.get("workspace_id") or item.get("account_id") or path)[0:8]
+                    filename = f"{token_data.get('email') or account.email}-{workspace_label}.json"
+                    ok, msg = upload_to_cpa(token_data, filename=filename)
+                    task_logger.log(f"  [CPA:{workspace_label}] {'✓ ' + msg if ok else '✗ ' + msg}")
+                except Exception as exc:
+                    task_logger.log(f"  [CPA] 导出文件上传异常 {path}: {exc}", level="warning")
+            if uploaded_paths:
+                return
+
             class _AccountProxy:
                 pass
 
             target = _AccountProxy()
             target.email = account.email
-            extra = account.extra or {}
             target.access_token = extra.get("access_token") or account.token
             target.refresh_token = extra.get("refresh_token", "")
             target.id_token = extra.get("id_token", "")
             target.session_token = extra.get("session_token", "")
             target.user_id = account.user_id or ""
-            target.account_id = account.user_id or ""
+            target.account_id = (
+                extra.get("account_id")
+                or extra.get("chatgpt_account_id")
+                or extra.get("workspace_id")
+                or account.user_id
+                or ""
+            )
             target.cookies = extra.get("cookies", "")
 
             token_data = generate_token_json(target)
@@ -734,6 +763,29 @@ def _mark_outlook_mailbox_event(shared_mailbox, account, event: str, logger: Tas
         logger.log(f"outlookEmail 自动打标签失败（忽略）: {exc}", level="warning")
 
 
+def _release_failed_mailbox_resource(shared_mailbox, platform, logger: TaskLogger, reason: str = "") -> bool:
+    identity = getattr(platform, "_last_identity", None) if platform is not None else None
+    mailbox_account = getattr(identity, "mailbox_account", None)
+    if mailbox_account is None:
+        return False
+
+    mailbox = shared_mailbox or getattr(platform, "mailbox", None)
+    release = getattr(mailbox, "release", None)
+    if not callable(release):
+        return False
+
+    try:
+        ok = bool(release(mailbox_account, reason=reason))
+    except Exception as exc:
+        logger.log(f"邮箱资源释放失败: {exc}", level="error")
+        return False
+
+    if ok:
+        email = str(getattr(mailbox_account, "email", "") or "").strip()
+        logger.log(f"已释放邮箱资源: {email or '-'}")
+    return ok
+
+
 def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger: TaskLogger, resolved_proxy: str | None = None, shared_mailbox=None):
     from core.base_identity import normalize_identity_provider
     from core.base_mailbox import create_mailbox
@@ -756,7 +808,7 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
             extra["mail_provider"] = ProviderSettingsRepository().get_default_provider_key("mailbox")
         mailbox = create_mailbox(
             provider=extra.get("mail_provider", ""),
-            extra=extra,
+            extra={**extra, "_cancel_check": logger.is_cancel_requested},
             proxy=resolved_proxy,
         )
 
@@ -866,6 +918,24 @@ def _resolve_sms_provider_for_task(extra: dict[str, Any]) -> tuple[str, dict[str
     return provider_key, settings
 
 
+def _resolve_mailbox_provider_for_task(extra: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository
+    from infrastructure.provider_settings_repository import ProviderSettingsRepository
+
+    settings_repo = ProviderSettingsRepository()
+    definitions_repo = ProviderDefinitionsRepository()
+    provider_key = str(
+        extra.get("mail_provider")
+        or settings_repo.get_default_provider_key("mailbox")
+        or ""
+    ).strip()
+    definition = definitions_repo.get_by_key("mailbox", provider_key) if provider_key else None
+    settings = settings_repo.resolve_runtime_settings("mailbox", provider_key, extra) if definition else dict(extra)
+    if provider_key:
+        settings["mail_provider"] = provider_key
+    return provider_key, settings
+
+
 def _bool_config(value: Any, default: bool) -> bool:
     if value in (None, ""):
         return default
@@ -879,6 +949,18 @@ def _int_config(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_smsbower_mail_stop_error(error: str) -> bool:
+    normalized = str(error or "").lower()
+    return (
+        "activation 已达本任务上限" in str(error or "")
+        or "继续取码上限" in str(error or "")
+        or "maximum number of codes" in normalized
+        or "smsbower mail 获取邮箱失败" in normalized
+        or "/api/mail/getactivation" in normalized
+        or "getactivation" in normalized
+    )
 
 
 def _resolve_registration_proxy_for_platform(
@@ -1172,6 +1254,11 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     password = payload.get("password") or None
     proxy = payload.get("proxy") or None
     extra = dict(payload.get("extra") or {})
+    mailbox_provider_key, mailbox_settings = _resolve_mailbox_provider_for_task(extra)
+    if str(extra.get("identity_provider") or "mailbox").strip().lower() in {"", "mailbox"}:
+        extra = mailbox_settings
+        payload = dict(payload)
+        payload["extra"] = extra
 
     # 强校验：ChatGPT Plus 自动支付链接 + sms_pool 模式下，**每个并发线程
     # 独占一条 SMS 号**——所以数量约束是 ``len(pool) >= concurrency``，**不是**
@@ -1228,12 +1315,31 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     for slot_index in range(len(sms_pool_slots)):
         sms_slot_queue.put(slot_index)
     sms_provider_key, sms_settings = _resolve_sms_provider_for_task(extra)
-    herosms_enabled = sms_provider_key == "herosms" and bool(str(sms_settings.get("herosms_api_key") or "").strip())
+    herosms_enabled = sms_provider_key in {"herosms", "herosms_api"} and bool(str(sms_settings.get("herosms_api_key") or "").strip())
     hero_extra_max = max(_int_config(sms_settings.get("register_phone_extra_max"), 3), 0) if herosms_enabled else 0
     hero_reuse_to_max = _bool_config(sms_settings.get("register_reuse_phone_to_max"), True) if herosms_enabled else False
+    smsbower_mail_alias_batch = (
+        platform_name == "chatgpt"
+        and mailbox_provider_key in {"smsbower_mail_api", "smsbower_mail"}
+        and _bool_config(extra.get("smsbower_mail_alias"), False)
+    )
+    smsbower_mail_reuse_limit = 1
+    if smsbower_mail_alias_batch:
+        smsbower_mail_reuse_limit = max(_int_config(extra.get("smsbower_mail_reuse_limit"), 5), 1)
+        logger.log(
+            f"SMSBower alias 批量模式: 目标成功账号 {count} 个，"
+            f"每个邮箱最多尝试 {smsbower_mail_reuse_limit} 个别名；失败不计数，继续获取邮箱重试"
+        )
+        manual_activation_lines = [
+            line for line in str(extra.get("smsbower_mail_manual_activations") or "").splitlines()
+            if line.strip()
+        ]
+        if manual_activation_lines:
+            logger.log(f"SMSBower Mail 收到本次手动 activation: {len(manual_activation_lines)} 条")
+
     target_success = count
-    max_success = count + hero_extra_max if herosms_enabled and hero_reuse_to_max else count
-    progress_total = max_success if herosms_enabled else count
+    max_success = target_success + hero_extra_max if herosms_enabled and hero_reuse_to_max else target_success
+    progress_total = max_success if herosms_enabled else target_success
     registration_base_proxy = _resolve_registration_proxy_for_platform(
         platform_name,
         explicit_proxy=proxy,
@@ -1246,6 +1352,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             f"HeroSMS 模式: 成功目标 {target_success}，失败自动补尝试，"
             f"号码仍可复用时最多额外成功 {hero_extra_max} 个"
         )
+    smsbower_mail_exhausted = threading.Event()
 
     try:
         get(platform_name)
@@ -1272,7 +1379,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 extra["mail_provider"] = ProviderSettingsRepository().get_default_provider_key("mailbox")
             shared_mailbox = create_mailbox(
                 provider=extra.get("mail_provider", ""),
-                extra=extra,
+                extra={**extra, "_cancel_check": logger.is_cancel_requested},
                 proxy=registration_base_proxy or None,
             )
     except Exception as exc:
@@ -1406,29 +1513,40 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 from platforms.chatgpt.workspace_join import workspace_join_enabled
 
                 if workspace_join_enabled(dict(_build_payload.get("extra") or {})):
+                    _build_payload = dict(_build_payload)
+                    _workspace_extra = dict(_build_payload.get("extra") or {})
+
+                    def _early_save_account(account):
+                        save_account(account)
+                        logger.log(f"基础账号已先保存: {getattr(account, 'email', '')}")
+
+                    _workspace_extra["_early_save_account"] = _early_save_account
+                    _build_payload["extra"] = _workspace_extra
                     current_executor = str(_build_payload.get("executor_type") or "").strip().lower()
                     if current_executor == "protocol":
-                        _build_payload = dict(_build_payload)
                         _build_payload["executor_type"] = "headed"
                         logger.log("Workspace Join 需要复用当前 ChatGPT 页面，已将本次注册执行器从 protocol 切换为 headed")
             except Exception as exc:
                 logger.log(f"Workspace Join 配置检查失败，继续原注册流程: {exc}", level="error")
+        platform = None
         try:
             platform = _build_platform_instance(platform_name, _build_payload, logger, resolved_proxy=resolved_proxy, shared_mailbox=shared_mailbox)
             # 失败不计进度的模式（chatgpt_plus_must_succeed）下 index 可能 > count，
             # 显示成"已成功 X/N，本次为第 M 次尝试"更直观。
             if chatgpt_plus_must_succeed:
                 logger.log(
-                    f"开始注册账号（已成功 {success}/{count}，本次第 {index + 1} 次尝试）"
+                    f"开始注册账号（已成功 {success}/{target_success}，本次第 {index + 1} 次尝试）"
                 )
             else:
-                logger.log(f"开始注册第 {index + 1}/{count} 个账号")
+                logger.log(f"开始注册第 {index + 1}/{target_success} 个账号")
             if resolved_proxy:
                 logger.log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
             save_account(account)
             workspace_join_error = _chatgpt_workspace_join_failure(account)
             if workspace_join_error:
+                _auto_upload_cpa(logger, account)
+                post_register_failure.set()
                 logger.record_error(workspace_join_error)
                 logger.log(workspace_join_error, level="error")
                 _save_task_log(platform_name, account.email, "failed", error=workspace_join_error)
@@ -1505,6 +1623,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
+            if smsbower_mail_alias_batch and _is_smsbower_mail_stop_error(error):
+                smsbower_mail_exhausted.set()
+            _release_failed_mailbox_resource(shared_mailbox, platform, logger, reason=error)
             logger.record_error(error)
             logger.log(f"✗ 注册失败: {error}", level="error")
             _save_task_log(platform_name, email or "", "failed", error=error)
@@ -1551,6 +1672,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         submitted = 0
         completed = 0
         futures: dict[Any, int] = {}
+        post_register_failure = threading.Event()
         # ChatGPT Plus 自动支付链接场景：用户诉求"设置生成 N 个必须生成 N 个
         # 成功"——失败的账号进入 gpt 账户池但**不增加进度**，调度继续投新任务
         # 直到 success 达到 count。最多投 ``count * 5`` 次防止号池烂掉时无限
@@ -1559,11 +1681,16 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             platform_name == "chatgpt"
             and _bool_config(extra.get("auto_chatgpt_plus_payment"), False)
         )
-        if chatgpt_plus_must_succeed:
-            max_attempts = max(count * 5, count, 1)
+        chatgpt_retry_until_success = platform_name == "chatgpt"
+        if smsbower_mail_alias_batch:
+            # SMSBower Mail 库存和邮件送达都不稳定。用户要求“完整跑通才计数”，
+            # 接不到验证码/注册失败时继续获取邮箱重试，直到成功数达标或用户取消。
+            max_attempts = 1_000_000_000
+        elif chatgpt_retry_until_success:
+            max_attempts = max(target_success * 5, target_success, 1)
         else:
             max_attempts = max(
-                count if not herosms_enabled else max_success * 3, 1
+                target_success if not herosms_enabled else max_success * 3, 1
             )
 
         def _hero_phone_alive() -> bool:
@@ -1586,6 +1713,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         def _should_submit_more() -> bool:
             if submitted >= max_attempts or logger.is_cancel_requested():
                 return False
+            if post_register_failure.is_set():
+                return False
+            if smsbower_mail_exhausted.is_set():
+                return False
             # SMS 号池被耗尽（某条号被拒 + 备份池空）→ 整个任务级别停止
             # 投新任务，让正在跑的任务跑完后退出。否则下一批又抢同一条死号
             # 继续被拒（用户实战日志 "开始注册第 2/1 个账号" 即此场景）。
@@ -1599,12 +1730,11 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 # qsize 是近似的（多线程下不严格），但作为"全死光"判定够用
                 if sms_slot_queue.qsize() == 0 and len(futures) >= concurrency:
                     return False
-            if chatgpt_plus_must_succeed:
-                # 必须达到 count 个 success；失败不计 progress，继续投。
-                # 已成功 + 在跑的 ≥ count 时不再投（避免超额）。
-                return success + len(futures) < count
+            if chatgpt_retry_until_success:
+                # ChatGPT 注册失败常见于邮箱验证码超时、验证码失效或表单校验；失败不计进度，继续补投。
+                return success + len(futures) < target_success and submitted < max_attempts
             if not herosms_enabled:
-                return submitted < count
+                return submitted < target_success
             if success + len(futures) >= max_success:
                 return False
             if success < target_success:
@@ -1631,7 +1761,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                     logger.set_progress(
                         min(
                             success
-                            if (herosms_enabled or chatgpt_plus_must_succeed)
+                            if (herosms_enabled or chatgpt_retry_until_success)
                             else completed,
                             progress_total,
                         ),
@@ -1647,7 +1777,17 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
         return
 
-    if herosms_enabled:
+    if smsbower_mail_alias_batch:
+        logger.set_result_data({
+            "target_count": target_success,
+            "reuse_limit": smsbower_mail_reuse_limit,
+            "attempts": submitted,
+            "success": success,
+            "fail": len(errors),
+            "smsbower_mail_alias_batch": True,
+            "stopped_by_mail_limit": smsbower_mail_exhausted.is_set(),
+        })
+    elif herosms_enabled:
         logger.set_result_data({
             "target_count": target_success,
             "attempts": submitted,

@@ -194,6 +194,59 @@ _PLAYWRIGHT_PAGEERROR_PATCH_REPLACEMENTS = (
     ('column: pageError.location.columnNumber', 'column: pageError.location?.columnNumber || 0'),
 )
 
+_PLAYWRIGHT_WEBSOCKET_OPENED_ASSERTION_PATCH_REPLACEMENTS = (
+    (
+        """      _onWebSocketOpened(event) {
+        const request2 = this._webSocketRequests.get(event.requestId);
+        assert(request2);
+        const response2 = this._webSocketResponses.get(event.requestId);
+        assert(response2);
+        this._webSocketRequests.delete(event.requestId);
+        this._webSocketResponses.delete(event.requestId);
+        this._page.frameManager.onWebSocketRequest(webSocketId(event.frameId, event.wsid), request2.headers);
+        this._page.frameManager.onWebSocketResponse(webSocketId(event.frameId, event.wsid), response2.status, response2.statusText, response2.headers);
+      }""",
+        """      _onWebSocketOpened(event) {
+        const request2 = this._webSocketRequests.get(event.requestId);
+        const response2 = this._webSocketResponses.get(event.requestId);
+        if (!request2 || !response2) {
+          this._webSocketRequests.delete(event.requestId);
+          this._webSocketResponses.delete(event.requestId);
+          return;
+        }
+        this._webSocketRequests.delete(event.requestId);
+        this._webSocketResponses.delete(event.requestId);
+        this._page.frameManager.onWebSocketRequest(webSocketId(event.frameId, event.wsid), request2.headers);
+        this._page.frameManager.onWebSocketResponse(webSocketId(event.frameId, event.wsid), response2.status, response2.statusText, response2.headers);
+      }""",
+    ),
+    (
+        """  _onWebSocketOpened(event) {
+    const request2 = this._webSocketRequests.get(event.requestId);
+    assert(request2);
+    const response2 = this._webSocketResponses.get(event.requestId);
+    assert(response2);
+    this._webSocketRequests.delete(event.requestId);
+    this._webSocketResponses.delete(event.requestId);
+    this._page.frameManager.onWebSocketRequest(webSocketId(event.frameId, event.wsid), request2.headers);
+    this._page.frameManager.onWebSocketResponse(webSocketId(event.frameId, event.wsid), response2.status, response2.statusText, response2.headers);
+  }""",
+        """  _onWebSocketOpened(event) {
+    const request2 = this._webSocketRequests.get(event.requestId);
+    const response2 = this._webSocketResponses.get(event.requestId);
+    if (!request2 || !response2) {
+      this._webSocketRequests.delete(event.requestId);
+      this._webSocketResponses.delete(event.requestId);
+      return;
+    }
+    this._webSocketRequests.delete(event.requestId);
+    this._webSocketResponses.delete(event.requestId);
+    this._page.frameManager.onWebSocketRequest(webSocketId(event.frameId, event.wsid), request2.headers);
+    this._page.frameManager.onWebSocketResponse(webSocketId(event.frameId, event.wsid), response2.status, response2.statusText, response2.headers);
+  }""",
+    ),
+)
+
 
 def _playwright_core_bundle_path() -> Path:
     import playwright
@@ -208,10 +261,10 @@ def _patch_playwright_firefox_pageerror_location_bug(
 ) -> bool:
     """Patch Playwright's Firefox pageerror dispatcher for Camoufox.
 
-    Some Camoufox/Firefox page errors arrive without a location object. The
-    bundled Playwright driver dereferences pageError.location.url directly and
-    crashes the Node driver process. This idempotent local patch guards the
-    dispatcher so the browser can stay alive in headed debug mode.
+    Some Camoufox/Firefox events arrive with fields missing from what the
+    bundled Playwright driver expects. Guard those dispatchers so the Node
+    driver process does not crash after registration has already consumed a
+    paid mailbox activation.
     """
     log = log_fn or (lambda message: logger.info(message))
     path = Path(bundle_path) if bundle_path is not None else _playwright_core_bundle_path()
@@ -223,6 +276,8 @@ def _patch_playwright_firefox_pageerror_location_bug(
 
     patched = text
     for old, new in _PLAYWRIGHT_PAGEERROR_PATCH_REPLACEMENTS:
+        patched = patched.replace(old, new)
+    for old, new in _PLAYWRIGHT_WEBSOCKET_OPENED_ASSERTION_PATCH_REPLACEMENTS:
         patched = patched.replace(old, new)
     if patched == text:
         return False

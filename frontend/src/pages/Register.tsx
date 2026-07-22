@@ -344,15 +344,44 @@ export default function Register() {
     </div>
   )
 
-  const renderProviderField = (field: any) => (
-    <Input
-      key={field.key}
-      label={field.label}
-      k={field.key}
-      type={field.secret ? 'password' : 'text'}
-      placeholder={field.placeholder || ''}
-    />
-  )
+  const renderProviderField = (field: any) => {
+    if (field.type === 'textarea') {
+      return (
+        <div key={field.key}>
+          <label className="block text-xs text-[var(--text-muted)] mb-1">{field.label}</label>
+          <textarea
+            value={(form as any)[field.key] || ''}
+            onChange={e => set(field.key, e.target.value)}
+            placeholder={field.placeholder || ''}
+            rows={3}
+            className="control-surface min-h-[88px] resize-y"
+          />
+        </div>
+      )
+    }
+    if (field.type === 'toggle') {
+      const checked = ['1', 'true', 'yes', 'on', '是'].includes(String((form as any)[field.key] || '').toLowerCase())
+      return (
+        <label key={field.key} className="flex items-center gap-2 text-sm text-[var(--text-primary)]">
+          <input
+            type="checkbox"
+            checked={checked}
+            onChange={e => set(field.key, e.target.checked ? '1' : '')}
+          />
+          {field.label}
+        </label>
+      )
+    }
+    return (
+      <Input
+        key={field.key}
+        label={field.label}
+        k={field.key}
+        type={field.secret ? 'password' : 'text'}
+        placeholder={field.placeholder || ''}
+      />
+    )
+  }
 
   const summaryRegistration = registrationOptions.find(option => option.identityProvider === form.identity_provider && option.oauthProvider === form.oauth_provider)?.label || '-'
   const summaryExecutor = executorOptions.find(option => option.value === form.executor_type)?.label || '-'

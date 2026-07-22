@@ -3491,6 +3491,49 @@ location: {
     ) is False
 
 
+def test_patch_playwright_firefox_websocket_opened_assertion_bug(tmp_path):
+    bundle = tmp_path / "coreBundle.js"
+    bundle.write_text(
+        """
+  _onWebSocketOpened(event) {
+    const request2 = this._webSocketRequests.get(event.requestId);
+    assert(request2);
+    const response2 = this._webSocketResponses.get(event.requestId);
+    assert(response2);
+    this._webSocketRequests.delete(event.requestId);
+    this._webSocketResponses.delete(event.requestId);
+    this._page.frameManager.onWebSocketRequest(webSocketId(event.frameId, event.wsid), request2.headers);
+    this._page.frameManager.onWebSocketResponse(webSocketId(event.frameId, event.wsid), response2.status, response2.statusText, response2.headers);
+  }
+""",
+        encoding="utf-8",
+    )
+
+    changed = payment_module._patch_playwright_firefox_pageerror_location_bug(
+        bundle_path=bundle,
+        log_fn=lambda message: None,
+    )
+
+    patched = bundle.read_text(encoding="utf-8")
+    assert changed is True
+    assert "assert(request2);" not in patched
+    assert "assert(response2);" not in patched
+    assert "if (!request2 || !response2)" in patched
+    assert payment_module._patch_playwright_firefox_pageerror_location_bug(
+        bundle_path=bundle,
+        log_fn=lambda message: None,
+    ) is False
+
+
+def test_chatgpt_session_driver_disconnect_is_terminal():
+    from platforms.chatgpt import browser_register
+
+    assert browser_register._is_playwright_driver_disconnected(
+        "Page.evaluate: Connection closed while reading from the driver"
+    )
+    assert browser_register._is_playwright_driver_disconnected("timeout waiting for token") is False
+
+
 def test_probe_camoufox_proxy_exit_logs_browser_ip():
     logs = []
 

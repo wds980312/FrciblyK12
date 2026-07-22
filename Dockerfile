@@ -10,7 +10,11 @@ RUN npm run build
 FROM python:3.12-slim
 
 # 系统依赖：Chromium、Xvfb、x11vnc、noVNC
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update -o Acquire::Retries=5 \
+    && apt-get install -y --no-install-recommends \
+    -o Acquire::Retries=5 \
+    -o Acquire::http::Timeout=60 \
     # 浏览器运行依赖
     chromium chromium-driver \
     # 虚拟显示 + VNC
@@ -31,10 +35,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # 安装 patchright/playwright 浏览器（Solver 使用）
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-RUN playwright install --with-deps chromium
+RUN playwright install chromium
 
 # 安装 camoufox 浏览器（Solver 的 camoufox 模式使用）
-RUN python -m camoufox fetch
+RUN python -m camoufox fetch || \
+    echo "Camoufox fetch skipped during build; it will be retried at runtime."
 
 # 复制后端代码
 ARG APP_VERSION=dev

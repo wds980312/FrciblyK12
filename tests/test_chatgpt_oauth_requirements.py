@@ -276,6 +276,44 @@ def test_browser_registration_flow_starts_from_chatgpt_nextauth(monkeypatch):
     assert state["page_type"] == "oauth_callback"
 
 
+def test_handle_post_signup_onboarding_grants_storage_and_clicks_continue(monkeypatch):
+    calls = {"permissions": [], "clicked": False, "logs": []}
+
+    class FakeContext:
+        def grant_permissions(self, permissions, origin=None):
+            calls["permissions"].append((permissions, origin))
+
+    class FakePage:
+        url = "https://chatgpt.com/"
+        context = FakeContext()
+
+        def evaluate(self, script):
+            calls["clicked"] = "Continue" in script and "Okay,? let's go" in script
+            return {"ok": True, "text": "Continue"}
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+        def locator(self, *_args, **_kwargs):
+            class FakeLocator:
+                @property
+                def first(self):
+                    return self
+
+                def count(self):
+                    return 0
+
+            return FakeLocator()
+
+    monkeypatch.setattr(browser_register_module, "_click_first", lambda *_args, **_kwargs: "")
+
+    browser_register_module._handle_post_signup_onboarding(FakePage(), calls["logs"].append)
+
+    assert calls["permissions"] == [(["persistent-storage"], "https://chatgpt.com")]
+    assert calls["clicked"] is True
+    assert any("初始确认页" in item for item in calls["logs"])
+
+
 def test_browser_register_run_returns_after_registration_without_codex_oauth(monkeypatch):
     class FakePage:
         def __init__(self):
@@ -291,6 +329,9 @@ def test_browser_register_run_returns_after_registration_without_codex_oauth(mon
 
         def __exit__(self, exc_type, exc, tb):
             return False
+
+        def new_context(self, **_kwargs):
+            return self
 
         def new_page(self):
             return FakePage()

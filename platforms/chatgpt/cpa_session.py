@@ -7,8 +7,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
-from .constants import CHATGPT_APP
+from .constants import CHATGPT_APP, OPENAI_AUTH
+
+
+AUTH_WORKSPACE_URL = f"{OPENAI_AUTH}/workspace"
+AUTH_WORKSPACE_SELECT_URL = f"{OPENAI_AUTH}/api/accounts/workspace/select"
 
 
 def _first_text(*values: Any) -> str:
@@ -184,14 +189,14 @@ def convert_chatgpt_session_to_cpa_json(
         payload.get("email"),
     )
     account_id = _first_text(
-        account.get("id"),
-        session.get("account_id"),
-        session.get("chatgptAccountId"),
-        provider_data.get("chatgptAccountId"),
-        provider_data.get("chatgpt_account_id"),
-        credentials.get("chatgpt_account_id"),
         auth.get("chatgpt_account_id"),
         id_auth.get("chatgpt_account_id"),
+        credentials.get("chatgpt_account_id"),
+        provider_data.get("chatgptAccountId"),
+        provider_data.get("chatgpt_account_id"),
+        session.get("chatgptAccountId"),
+        session.get("account_id"),
+        account.get("id"),
         session.get("id") if session.get("provider") == "codex" else "",
     )
     user_id = _first_text(
@@ -206,15 +211,15 @@ def convert_chatgpt_session_to_cpa_json(
         id_auth.get("user_id"),
     )
     plan_type = _first_text(
-        account.get("planType"),
-        account.get("plan_type"),
-        session.get("planType"),
-        session.get("plan_type"),
-        provider_data.get("chatgptPlanType"),
-        provider_data.get("chatgpt_plan_type"),
-        credentials.get("plan_type"),
         auth.get("chatgpt_plan_type"),
         id_auth.get("chatgpt_plan_type"),
+        credentials.get("plan_type"),
+        provider_data.get("chatgptPlanType"),
+        provider_data.get("chatgpt_plan_type"),
+        session.get("planType"),
+        session.get("plan_type"),
+        account.get("planType"),
+        account.get("plan_type"),
     )
     synthetic_id_token = ""
     if not input_id_token:
@@ -291,6 +296,294 @@ def _read_json_body_from_page(page) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError("session page did not return a JSON object")
     return data
+
+
+def _session_account_id(session_json: dict[str, Any]) -> str:
+    try:
+        return str(convert_chatgpt_session_to_cpa_json(session_json).get("account_id") or "").strip()
+    except Exception:
+        return ""
+
+
+def _workspace_id_matches(account_id: str, workspace_id: str) -> bool:
+    account_id = str(account_id or "").strip()
+    workspace_id = str(workspace_id or "").strip()
+    if not account_id or not workspace_id:
+        return False
+    return account_id == workspace_id or account_id.startswith(workspace_id) or workspace_id.startswith(account_id)
+
+
+def _ensure_chatgpt_page(page) -> None:
+    current_url = str(getattr(page, "url", "") or "")
+    if "chatgpt.com" not in current_url.lower():
+        page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=60000)
+
+
+def _fetch_session_json_via_api(page, *, workspace_id: str = "") -> dict[str, Any]:
+    _ensure_chatgpt_page(page)
+    result = page.evaluate(
+        """
+        async ({ workspaceId }) => {
+          const headers = { accept: "*/*" };
+          if (workspaceId) {
+            headers["Chatgpt-Account-Id"] = workspaceId;
+            headers["chatgpt-account-id"] = workspaceId;
+          }
+          const response = await fetch("/api/auth/session", {
+            method: "GET",
+            credentials: "include",
+            cache: "no-store",
+            headers,
+          });
+          const text = await response.text().catch(() => "");
+          let json = {};
+          try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+          return { ok: response.ok, status: response.status, text: text.slice(0, 300), json };
+        }
+        """,
+        {"workspaceId": str(workspace_id or "").strip()},
+    )
+    data = dict(result or {})
+    if not data.get("ok"):
+        raise RuntimeError(f"session API HTTP {data.get('status')}: {str(data.get('text') or '')[:160]}")
+    session_json = data.get("json")
+    if not isinstance(session_json, dict):
+        raise RuntimeError("session API did not return JSON object")
+    return session_json
+
+
+def _read_current_session_json(page) -> dict[str, Any]:
+    page.goto(f"{CHATGPT_APP}/api/auth/session", wait_until="domcontentloaded", timeout=60000)
+    return _read_json_body_from_page(page)
+
+
+def _follow_auth_workspace_select(page, next_url: str, *, log=None) -> None:
+    current_url = str(next_url or "").strip()
+    if not current_url:
+        raise RuntimeError("workspace/select response missing continue_url")
+
+    for _hop in range(8):
+        resolved = urljoin(OPENAI_AUTH, current_url)
+        _safe_log(log, f"Workspace Join: follow workspace/select -> {resolved.split('?')[0]}")
+        page.goto(resolved, wait_until="domcontentloaded", timeout=60000)
+        if resolved.startswith(f"{CHATGPT_APP}/api/auth/callback/openai"):
+            return
+        current = str(getattr(page, "url", "") or "").strip()
+        if current.startswith(f"{CHATGPT_APP}/"):
+            return
+        if current.startswith(f"{OPENAI_AUTH}/workspace"):
+            return
+        if current and current != resolved:
+            current_url = current
+            continue
+        return
+    raise RuntimeError(f"workspace/select follow exceeded redirects: {current_url}")
+
+
+def _select_workspace_session_via_auth(page, *, workspace_id: str, log=None) -> dict[str, Any]:
+    workspace_id = str(workspace_id or "").strip()
+    if not workspace_id:
+        return {"ok": False, "error": "empty workspace_id"}
+
+    _safe_log(log, f"Workspace Join: auth workspace/select {workspace_id[:8]}")
+    page.goto(AUTH_WORKSPACE_URL, wait_until="domcontentloaded", timeout=60000)
+    result = page.evaluate(
+        """
+        async ({ workspaceId }) => {
+          const response = await fetch("/api/accounts/workspace/select", {
+            method: "POST",
+            credentials: "include",
+            headers: {
+              accept: "application/json",
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ workspace_id: workspaceId }),
+          });
+          const text = await response.text().catch(() => "");
+          let json = {};
+          try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+          const nextUrl = String(json?.page?.payload?.url || json?.continue_url || "");
+          return {
+            ok: response.ok,
+            status: response.status,
+            url: response.url,
+            text: text.slice(0, 500),
+            nextUrl,
+          };
+        }
+        """,
+        {"workspaceId": workspace_id},
+    )
+    data = dict(result or {})
+    if not data.get("ok"):
+        return {
+            "ok": False,
+            "error": f"auth workspace/select HTTP {data.get('status')}: {str(data.get('text') or '')[:180]}",
+        }
+
+    next_url = str(data.get("nextUrl") or "").strip()
+    if next_url:
+        _follow_auth_workspace_select(page, next_url, log=log)
+    else:
+        _safe_log(log, "Workspace Join: auth workspace/select returned no continue_url; reading session directly")
+
+    session_json = _read_current_session_json(page)
+    account_id = _session_account_id(session_json)
+    if not _workspace_id_matches(account_id, workspace_id):
+        return {
+            "ok": False,
+            "error": f"auth workspace/select did not expose target session: account_id={account_id or '-'}",
+            "session": session_json,
+            "account_id": account_id,
+        }
+    _safe_log(log, f"Workspace Join: confirmed workspace by auth_select: {account_id[:8]}")
+    return {
+        "ok": True,
+        "method": "auth_workspace_select",
+        "session": session_json,
+        "account_id": account_id,
+    }
+
+
+def _wait_session_workspace_selected(
+    page,
+    *,
+    workspace_id: str,
+    timeout_ms: int = 5000,
+    log=None,
+) -> dict[str, Any]:
+    workspace_id = str(workspace_id or "").strip()
+    if not str(getattr(page, "url", "") or "").strip():
+        return {"ok": False, "error": "page url unavailable"}
+    deadline = time.monotonic() + max(int(timeout_ms), 1) / 1000
+    last_account_id = ""
+    last_exc: Exception | None = None
+    while time.monotonic() < deadline:
+        for header_workspace_id in (workspace_id, ""):
+            try:
+                session_json = _fetch_session_json_via_api(page, workspace_id=header_workspace_id)
+                account_id = _session_account_id(session_json)
+                last_account_id = account_id
+                if _workspace_id_matches(account_id, workspace_id):
+                    source = "session_api_header" if header_workspace_id else "session_api"
+                    _safe_log(log, f"Workspace Join: confirmed workspace by {source}: {account_id[:8]}")
+                    return {
+                        "ok": True,
+                        "session": session_json,
+                        "account_id": account_id,
+                        "source": source,
+                    }
+            except Exception as exc:
+                last_exc = exc
+        time.sleep(0.5)
+    detail = f"account_id={last_account_id or '-'}"
+    if last_exc is not None:
+        detail += f", last_error={last_exc}"
+    return {"ok": False, "error": detail}
+
+
+def _exchange_workspace_session_via_api(page, *, workspace_id: str, log=None) -> dict[str, Any]:
+    workspace_id = str(workspace_id or "").strip()
+    if not workspace_id:
+        return {"ok": False, "error": "empty workspace_id"}
+
+    _ensure_chatgpt_page(page)
+    result = page.evaluate(
+        """
+        async ({ workspaceId }) => {
+          const url = `/api/auth/session?exchange_workspace_token=true&workspace_id=${encodeURIComponent(workspaceId)}&reason=setCurrentAccount`;
+          const response = await fetch(url, {
+            method: "GET",
+            credentials: "include",
+            cache: "no-store",
+            headers: {
+              accept: "*/*",
+              "Chatgpt-Account-Id": workspaceId,
+              "chatgpt-account-id": workspaceId,
+            },
+          });
+          const text = await response.text().catch(() => "");
+          let json = {};
+          try { json = text ? JSON.parse(text) : {}; } catch (_) {}
+          return { ok: response.ok, status: response.status, url, text: text.slice(0, 300), json };
+        }
+        """,
+        {"workspaceId": workspace_id},
+    )
+    data = dict(result or {})
+    if not data.get("ok"):
+        return {
+            "ok": False,
+            "error": f"session exchange HTTP {data.get('status')}: {str(data.get('text') or '')[:160]}",
+        }
+
+    session_json = data.get("json")
+    if not isinstance(session_json, dict):
+        return {"ok": False, "error": "session exchange did not return JSON object"}
+
+    account_id = _session_account_id(session_json)
+    if not _workspace_id_matches(account_id, workspace_id):
+        return {
+            "ok": False,
+            "error": f"session exchange did not expose target workspace: account_id={account_id or '-'}",
+            "session": session_json,
+            "account_id": account_id,
+        }
+
+    _safe_log(log, f"Workspace Join: confirmed workspace by session exchange: {account_id[:8]}")
+    return {
+        "ok": True,
+        "method": "session_exchange_workspace_token",
+        "session": session_json,
+        "account_id": account_id,
+    }
+
+
+def _try_switch_workspace_via_api(page, *, workspace_id: str, log=None) -> dict[str, Any]:
+    workspace_id = str(workspace_id or "").strip()
+    if not workspace_id:
+        return {"ok": False, "error": "empty workspace_id"}
+
+    _ensure_chatgpt_page(page)
+    exchange_result = _exchange_workspace_session_via_api(page, workspace_id=workspace_id, log=log)
+    if (
+        isinstance(exchange_result, dict)
+        and exchange_result.get("ok")
+        and isinstance(exchange_result.get("session"), dict)
+    ):
+        return {
+            "ok": True,
+            "method": str(exchange_result.get("method") or "session_exchange_workspace_token"),
+            "session": dict(exchange_result["session"]),
+            "account_id": str(exchange_result.get("account_id") or ""),
+        }
+    _safe_log(
+        log,
+        "Workspace Join: session exchange failed, fallback to session probe: "
+        f"{exchange_result.get('error') if isinstance(exchange_result, dict) else exchange_result}",
+    )
+
+    session_result = _wait_session_workspace_selected(
+        page,
+        workspace_id=workspace_id,
+        timeout_ms=12000,
+        log=log,
+    )
+    if (
+        isinstance(session_result, dict)
+        and session_result.get("ok")
+        and isinstance(session_result.get("session"), dict)
+    ):
+        return {
+            "ok": True,
+            "method": str(session_result.get("source") or "session_header_wait"),
+            "session": dict(session_result["session"]),
+            "account_id": str(session_result.get("account_id") or ""),
+        }
+    detail = session_result.get("error") if isinstance(session_result, dict) else session_result
+    error = f"session header did not expose workspace: {detail or 'not selected'}"
+    _safe_log(log, f"Workspace Join: {error}")
+    return {"ok": False, "error": error}
 
 
 def _profile_workspace_text(page, timeout_ms: int) -> str:
@@ -396,8 +689,9 @@ _ACCOUNT_SUBMENU_TARGET_SCRIPT = """
 
 
 _WORKSPACE_RADIO_TARGET_SCRIPT = """
-() => {
+(options = {}) => {
   // WORKSPACE_RADIO_TARGET
+  const skipTexts = new Set((options && Array.isArray(options.skipTexts) ? options.skipTexts : []).map(String));
   const textOf = (el) => String(
     el && (el.innerText || el.textContent || el.getAttribute("aria-label")) || ""
   ).replace(/\\s+/g, " ").trim();
@@ -409,7 +703,9 @@ _WORKSPACE_RADIO_TARGET_SCRIPT = """
       rect.width > 0 && rect.height > 0;
   };
   const workspacePattern = /Workspace|\\u5de5\\u4f5c\\u7a7a\\u95f4|\\u5de5\\u4f5c\\u533a/i;
-  const items = Array.from(document.querySelectorAll('[role="menuitemradio"]')).filter(visible);
+  const items = Array.from(document.querySelectorAll('[role="menuitemradio"]'))
+    .filter(visible)
+    .filter((item) => !skipTexts.has(textOf(item)));
   const target = items.find((item) => item.getAttribute("aria-checked") === "false" && workspacePattern.test(textOf(item))) ||
     items.find((item) => workspacePattern.test(textOf(item))) ||
     items.find((item) => item.getAttribute("aria-checked") === "false");
@@ -462,6 +758,60 @@ _WORKSPACE_READY_TARGET_SCRIPT = """
 }
 """
 
+_ONBOARDING_DISMISS_TARGET_SCRIPT = """
+() => {
+  // ONBOARDING_DISMISS_TARGET
+  const textOf = (el) => String(
+    el && (el.innerText || el.textContent || el.getAttribute("aria-label")) || ""
+  ).replace(/\\s+/g, " ").trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== "none" && style.visibility !== "hidden" &&
+      rect.width > 0 && rect.height > 0;
+  };
+  const normalized = (value) => String(value || "").replace(/[’‘`]/g, "'").replace(/\\s+/g, " ").trim();
+  const dismissPattern = /^(Continue|Okay,? let's go|Got it|Skip|Skip Tour|Next|Done|Copy|继续|好的|知道了|跳过|跳过导览|下一步|完成)$/i;
+  const candidates = Array.from(document.querySelectorAll('button, [role="button"]')).filter(visible);
+  const preferredTexts = [
+    "Skip Tour",
+    "跳过导览",
+    "Skip",
+    "跳过",
+    "Continue",
+    "Okay, let's go",
+    "Okay let's go",
+    "Got it",
+    "Done",
+    "Copy",
+    "Next",
+    "下一步",
+    "继续",
+    "好的",
+    "知道了",
+    "完成",
+  ];
+  const byText = (wanted) => candidates.find((button) => normalized(textOf(button)).toLowerCase() === wanted.toLowerCase());
+  const target = preferredTexts.map(byText).find(Boolean) ||
+    candidates.find((button) => dismissPattern.test(normalized(textOf(button))));
+  if (!target) {
+    return {
+      ok: false,
+      summary: `no onboarding button; candidates=${JSON.stringify(candidates.map(textOf).filter(Boolean).slice(0, 8))}`,
+    };
+  }
+  try { target.scrollIntoView({ block: "center", inline: "center" }); } catch (_) {}
+  const rect = target.getBoundingClientRect();
+  return {
+    ok: true,
+    x: rect.left + rect.width / 2,
+    y: rect.top + rect.height / 2,
+    text: textOf(target),
+  };
+}
+"""
+
 
 def _safe_log(log, message: str) -> None:
     if callable(log):
@@ -488,12 +838,13 @@ def _wait_for_dom_target(
     *,
     label: str,
     timeout_ms: int,
+    arg: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     deadline = time.monotonic() + max(int(timeout_ms), 1) / 1000
     last_summary = ""
     while time.monotonic() <= deadline:
         try:
-            result = page.evaluate(script)
+            result = page.evaluate(script, arg) if arg is not None else page.evaluate(script)
         except Exception as exc:
             if _looks_like_navigation_interrupt(exc):
                 raise
@@ -504,6 +855,8 @@ def _wait_for_dom_target(
             return result
         if isinstance(result, dict):
             last_summary = str(result.get("summary") or result)[:240]
+        elif result is not None:
+            return {"ok": False, "summary": f"{label}: unexpected result {str(result)[:120]}"}
         _page_wait(page, 150)
 
     if last_summary:
@@ -563,6 +916,7 @@ def _click_until_next_dom_target(
     log=None,
     move_after_click: bool = False,
     post_click_wait_ms: int = 250,
+    next_arg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     mouse = getattr(page, "mouse", None)
     if mouse is None or not hasattr(mouse, "click"):
@@ -579,6 +933,7 @@ def _click_until_next_dom_target(
             next_script,
             label=next_label,
             timeout_ms=next_probe_timeout,
+            arg=next_arg,
         )
         if isinstance(next_target, dict) and next_target.get("ok"):
             next_target["clickAttempts"] = attempts
@@ -611,12 +966,17 @@ def _click_until_next_dom_target(
             next_script,
             label=next_label,
             timeout_ms=next_timeout,
+            arg=next_arg,
         )
         if isinstance(next_target, dict) and next_target.get("ok"):
             next_target["clickAttempts"] = attempts
             return next_target
         if isinstance(next_target, dict):
             last_summary = str(next_target.get("summary") or next_target)[:240]
+        dismissed = _dismiss_chatgpt_onboarding(page, timeout_ms=200, log=log)
+        if dismissed:
+            _safe_log(log, f"Workspace Join: dismissed onboarding while waiting for {next_label}; retrying")
+            continue
         _safe_log(log, f"Workspace Join: {next_label} not visible after {click_label} click, retrying")
 
     raise RuntimeError(
@@ -635,6 +995,95 @@ def _wait_workspace_ready_after_click(page, timeout_ms: int) -> dict[str, Any]:
         return ready
     summary = str((ready or {}).get("summary") if isinstance(ready, dict) else ready or "")[:240]
     raise RuntimeError(f"timed out waiting for workspace ready signal: {summary}")
+
+
+def _dismiss_chatgpt_onboarding(page, *, timeout_ms: int = 2500, log=None) -> int:
+    deadline = time.monotonic() + max(int(timeout_ms), 1) / 1000
+    dismissed = 0
+    while time.monotonic() <= deadline and dismissed < 6:
+        target = _wait_for_dom_target(
+            page,
+            _ONBOARDING_DISMISS_TARGET_SCRIPT,
+            label="onboarding dismiss button",
+            timeout_ms=min(_remaining_ms(deadline), 500),
+        )
+        if not isinstance(target, dict) or not target.get("ok"):
+            break
+        _click_dom_target(page, target, label="onboarding button", log=log)
+        dismissed += 1
+        _page_wait(page, 350)
+    if dismissed:
+        _safe_log(log, f"Workspace Join: dismissed {dismissed} onboarding step(s)")
+    return dismissed
+
+
+def _reload_and_confirm_workspace_session(
+    page,
+    *,
+    workspace_id: str,
+    timeout_ms: int = 8000,
+    log=None,
+) -> dict[str, Any]:
+    _dismiss_chatgpt_onboarding(page, timeout_ms=2500, log=log)
+    try:
+        page.reload(wait_until="domcontentloaded", timeout=8000)
+        _safe_log(log, "Workspace Join: reloaded ChatGPT after workspace switch")
+    except Exception as exc:
+        _safe_log(log, f"Workspace Join: reload after workspace switch failed, continue confirming: {exc}")
+    _dismiss_chatgpt_onboarding(page, timeout_ms=2500, log=log)
+    return _wait_session_workspace_selected(
+        page,
+        workspace_id=workspace_id,
+        timeout_ms=timeout_ms,
+        log=log,
+    )
+
+
+def _switch_workspace_via_profile_menu_until_confirmed(
+    page,
+    *,
+    workspace_id: str,
+    timeout_ms: int = 45000,
+    log=None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(int(timeout_ms), 1) / 1000
+    skipped_texts: list[str] = []
+    last_error = ""
+    attempts = 0
+    while time.monotonic() <= deadline and attempts < 6:
+        attempts += 1
+        switch_result = switch_chatgpt_workspace_via_profile_menu(
+            page,
+            workspace_id=workspace_id,
+            timeout_ms=min(_remaining_ms(deadline), 12000),
+            log=log,
+            skip_workspace_texts=skipped_texts,
+        )
+        selected_text = str(switch_result.get("selectedText") or "").strip()
+        confirmed = _reload_and_confirm_workspace_session(
+            page,
+            workspace_id=workspace_id,
+            timeout_ms=min(_remaining_ms(deadline), 8000),
+            log=log,
+        )
+        if isinstance(confirmed, dict) and confirmed.get("ok") and isinstance(confirmed.get("session"), dict):
+            switch_result["sessionConfirmed"] = True
+            switch_result["session"] = dict(confirmed["session"])
+            switch_result["account_id"] = str(confirmed.get("account_id") or "")
+            switch_result["readySource"] = str(confirmed.get("source") or switch_result.get("readySource") or "")
+            return switch_result
+
+        last_error = str(confirmed.get("error") if isinstance(confirmed, dict) else confirmed or "")
+        if selected_text and selected_text not in skipped_texts:
+            skipped_texts.append(selected_text)
+            _safe_log(
+                log,
+                "Workspace Join: selected workspace item did not match target; "
+                f"skip next time: {selected_text} ({last_error})",
+            )
+            continue
+        break
+    raise RuntimeError(f"workspace session confirmation failed: {last_error or 'not selected'}")
 
 
 def _recover_workspace_ready_after_navigation(
@@ -680,12 +1129,42 @@ def _wait_profile_workspace_after_click(page, timeout_ms: int) -> str:
     return ""
 
 
+def _visible_workspace_menu_debug(page) -> str:
+    try:
+        data = page.evaluate(
+            """
+            () => {
+              const textOf = (el) => String(el?.innerText || el?.textContent || el?.getAttribute?.("aria-label") || "").replace(/\\s+/g, " ").trim();
+              const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== "none" && style.visibility !== "hidden" && rect.width > 0 && rect.height > 0;
+              };
+              return Array.from(document.querySelectorAll('button, a, [role="button"], [role="menuitem"], [role="menuitemradio"]'))
+                .filter(visible)
+                .map((el) => ({
+                  role: el.getAttribute("role") || el.tagName.toLowerCase(),
+                  testid: el.getAttribute("data-testid") || "",
+                  text: textOf(el).slice(0, 80),
+                }))
+                .filter((item) => item.text || item.testid)
+                .slice(0, 20);
+            }
+            """
+        )
+        return json.dumps(data, ensure_ascii=False)[:1200]
+    except Exception as exc:
+        return f"debug failed: {exc}"
+
+
 def _switch_workspace_via_profile_menu_stepwise(
     page,
     *,
     workspace_id: str = "",
     timeout_ms: int = 45000,
     log=None,
+    skip_workspace_texts: list[str] | None = None,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + max(int(timeout_ms), 1) / 1000
     _click_until_next_dom_target(
@@ -698,29 +1177,71 @@ def _switch_workspace_via_profile_menu_stepwise(
         log=log,
         post_click_wait_ms=300,
     )
-    workspace = _click_until_next_dom_target(
+
+    workspace = _wait_for_dom_target(
         page,
-        click_script=_ACCOUNT_SUBMENU_TARGET_SCRIPT,
-        next_script=_WORKSPACE_RADIO_TARGET_SCRIPT,
-        click_label="account submenu",
-        next_label="workspace radio item",
-        timeout_ms=_remaining_ms(deadline),
-        log=log,
-        move_after_click=True,
-        post_click_wait_ms=350,
+        _WORKSPACE_RADIO_TARGET_SCRIPT,
+        label="workspace radio item",
+        timeout_ms=min(_remaining_ms(deadline), 250),
+        arg={"skipTexts": skip_workspace_texts or []} if skip_workspace_texts else None,
     )
-    ready = _click_until_next_dom_target(
+    if not isinstance(workspace, dict) or not workspace.get("ok"):
+        _safe_log(log, "Workspace Join: workspace radio not visible directly; opening account submenu")
+        workspace = _click_until_next_dom_target(
+            page,
+            click_script=_ACCOUNT_SUBMENU_TARGET_SCRIPT,
+            next_script=_WORKSPACE_RADIO_TARGET_SCRIPT,
+            click_label="account submenu",
+            next_label="workspace radio item",
+            timeout_ms=_remaining_ms(deadline),
+            log=log,
+            move_after_click=True,
+            post_click_wait_ms=350,
+            next_arg={"skipTexts": skip_workspace_texts or []} if skip_workspace_texts else None,
+        )
+
+    _click_dom_target(page, workspace, label="workspace radio item", log=log)
+    _page_wait(page, 800)
+    confirmed = _wait_session_workspace_selected(
         page,
-        click_script=_WORKSPACE_RADIO_TARGET_SCRIPT,
-        next_script=_WORKSPACE_READY_TARGET_SCRIPT,
-        click_label="workspace radio item",
-        next_label="workspace ready signal",
-        timeout_ms=_remaining_ms(deadline),
+        workspace_id=workspace_id,
+        timeout_ms=min(_remaining_ms(deadline), 1200),
         log=log,
-        post_click_wait_ms=800,
     )
-    if not ready.get("text"):
-        ready = _wait_workspace_ready_after_click(page, _remaining_ms(deadline, minimum=3000))
+    if isinstance(confirmed, dict) and confirmed.get("ok"):
+        return {
+            "ok": True,
+            "workspaceId": str(workspace_id or "").strip(),
+            "selectedText": str(workspace.get("text") or ""),
+            "profileText": str(confirmed.get("account_id") or ""),
+            "readySource": str(confirmed.get("source") or "session_api"),
+            "stepwise": True,
+            "sessionConfirmed": True,
+            "session": dict(confirmed.get("session") or {}),
+            "account_id": str(confirmed.get("account_id") or ""),
+        }
+    ready: dict[str, Any] = {}
+    _wait_for_dom_target(
+        page,
+        _WORKSPACE_RADIO_TARGET_SCRIPT,
+        label="workspace radio item",
+        timeout_ms=250,
+        arg={"skipTexts": skip_workspace_texts or []} if skip_workspace_texts else None,
+    )
+    try:
+        ready = _wait_workspace_ready_after_click(page, min(_remaining_ms(deadline, minimum=1000), 3000))
+    except Exception as exc:
+        if _looks_like_navigation_interrupt(exc):
+            recovered = _recover_workspace_ready_after_navigation(
+                page,
+                workspace_id=workspace_id,
+                timeout_ms=min(_remaining_ms(deadline, minimum=1000), 5000),
+            )
+            recovered["selectedText"] = str(workspace.get("text") or recovered.get("selectedText") or "")
+            recovered["stepwise"] = True
+            recovered["sessionConfirmed"] = False
+            return recovered
+        _safe_log(log, f"Workspace Join: workspace ready signal not stable after click; will confirm by session: {exc}")
     return {
         "ok": True,
         "workspaceId": str(workspace_id or "").strip(),
@@ -728,15 +1249,16 @@ def _switch_workspace_via_profile_menu_stepwise(
         "profileText": str(ready.get("text") or ""),
         "readySource": str(ready.get("source") or ""),
         "stepwise": True,
+        "sessionConfirmed": False,
     }
-
 
 def switch_chatgpt_workspace_via_profile_menu(
     page,
     *,
     workspace_id: str = "",
-    timeout_ms: int = 45000,
+    timeout_ms: int = 12000,
     log=None,
+    skip_workspace_texts: list[str] | None = None,
 ) -> dict[str, Any]:
     page.goto(f"{CHATGPT_APP}/", wait_until="domcontentloaded", timeout=60000)
     try:
@@ -744,25 +1266,60 @@ def switch_chatgpt_workspace_via_profile_menu(
     except Exception:
         existing_profile_text = ""
     if existing_profile_text:
-        result = {
-            "ok": True,
-            "workspaceId": str(workspace_id or "").strip(),
-            "selectedText": "",
-            "profileText": existing_profile_text,
-            "alreadyWorkspace": True,
-        }
-        if callable(log):
-            try:
-                log(f"Workspace Join: already in workspace {existing_profile_text}")
-            except Exception:
-                pass
-        return result
+        if workspace_id:
+            confirmed = _wait_session_workspace_selected(
+                page,
+                workspace_id=workspace_id,
+                timeout_ms=min(int(timeout_ms), 2500),
+                log=log,
+            )
+            if not (isinstance(confirmed, dict) and confirmed.get("ok")):
+                _safe_log(
+                    log,
+                    "Workspace Join: profile already shows a workspace but session is not target; "
+                    f"continue switching ({confirmed.get('error') if isinstance(confirmed, dict) else confirmed})",
+                )
+                existing_profile_text = ""
+            else:
+                result = {
+                    "ok": True,
+                    "workspaceId": str(workspace_id or "").strip(),
+                    "selectedText": "",
+                    "profileText": existing_profile_text,
+                    "alreadyWorkspace": True,
+                    "sessionConfirmed": True,
+                    "session": dict(confirmed.get("session") or {}),
+                    "account_id": str(confirmed.get("account_id") or ""),
+                    "readySource": str(confirmed.get("source") or "session_api"),
+                }
+                if callable(log):
+                    try:
+                        log(f"Workspace Join: already in target workspace {existing_profile_text}")
+                    except Exception:
+                        pass
+                return result
+        if existing_profile_text:
+            result = {
+                "ok": True,
+                "workspaceId": str(workspace_id or "").strip(),
+                "selectedText": "",
+                "profileText": existing_profile_text,
+                "alreadyWorkspace": True,
+            }
+            if callable(log):
+                try:
+                    log(f"Workspace Join: already in workspace {existing_profile_text}")
+                except Exception:
+                    pass
+            return result
+    _dismiss_chatgpt_onboarding(page, timeout_ms=min(int(timeout_ms), 3500), log=log)
     try:
         result = _switch_workspace_via_profile_menu_stepwise(
             page,
             workspace_id=workspace_id,
             timeout_ms=timeout_ms,
             log=log,
+            skip_workspace_texts=skip_workspace_texts,
         )
         if isinstance(result, dict) and result.get("ok"):
             if callable(log):
@@ -791,6 +1348,7 @@ def switch_chatgpt_workspace_via_profile_menu(
                     pass
             return result
         _safe_log(log, f"Workspace Join: stepwise profile menu switch failed, fallback: {stepwise_exc}")
+        _safe_log(log, f"Workspace Join: visible menu debug: {_visible_workspace_menu_debug(page)}")
     try:
         result = page.evaluate(
             """
@@ -890,19 +1448,62 @@ def export_workspace_cpa_session_from_browser(
     workspace_id: str = "",
     output_dir: str | Path | None = None,
     now: datetime | None = None,
+    use_auth_workspace_select: bool = False,
     log=None,
 ) -> dict[str, Any]:
     workspace_id = str(workspace_id or "").strip()
-    if workspace_id:
-        switch_chatgpt_workspace_via_profile_menu(page, workspace_id=workspace_id, log=log)
-
     session_url = f"{CHATGPT_APP}/api/auth/session"
-    page.goto(session_url, wait_until="domcontentloaded", timeout=60000)
-    session_json = _read_json_body_from_page(page)
+
+    api_switch_result: dict[str, Any] = {}
+    session_json: dict[str, Any] | None = None
+    if workspace_id:
+        if use_auth_workspace_select:
+            auth_select_result = _select_workspace_session_via_auth(page, workspace_id=workspace_id, log=log)
+            if auth_select_result.get("ok") and isinstance(auth_select_result.get("session"), dict):
+                session_json = dict(auth_select_result["session"])
+                api_switch_result = {"method": str(auth_select_result.get("method") or "auth_workspace_select")}
+                _safe_log(log, "Workspace Join: using auth workspace/select session")
+            else:
+                _safe_log(
+                    log,
+                    "Workspace Join: auth workspace/select failed, fallback to session probe: "
+                    f"{auth_select_result.get('error') or 'not selected'}",
+                )
+        else:
+            _safe_log(log, "Workspace Join: skip auth workspace/select; using session/UI switch path")
+
+        if session_json is None:
+            api_switch_result = _try_switch_workspace_via_api(page, workspace_id=workspace_id, log=log)
+        if api_switch_result.get("ok") and isinstance(api_switch_result.get("session"), dict):
+            session_json = dict(api_switch_result["session"])
+            _safe_log(log, f"Workspace Join: using API switched session ({api_switch_result.get('method')})")
+        elif session_json is None:
+            _safe_log(log, f"Workspace Join: API switch failed, fallback to UI: {api_switch_result.get('error') or 'not selected'}")
+            ui_result = _switch_workspace_via_profile_menu_until_confirmed(
+                page,
+                workspace_id=workspace_id,
+                timeout_ms=45000,
+                log=log,
+            )
+            session_json = dict(ui_result["session"])
+            api_switch_result = {"method": str(ui_result.get("readySource") or "ui_session_confirmed")}
+
+    if session_json is None:
+        page.goto(session_url, wait_until="domcontentloaded", timeout=60000)
+        session_json = _read_json_body_from_page(page)
     cpa_json = convert_chatgpt_session_to_cpa_json(session_json, now=now)
+    account_id = str(cpa_json.get("account_id") or "").strip()
+    if workspace_id and not _workspace_id_matches(account_id, workspace_id):
+        raise RuntimeError(
+            "workspace account_id mismatch: "
+            f"target={workspace_id}, session_account_id={account_id or '-'}"
+        )
+    export_email = str(cpa_json.get("email") or "")
+    if workspace_id:
+        export_email = f"{export_email}-{workspace_id[:8]}"
     path = save_cpa_json_locally(
         cpa_json,
-        email=str(cpa_json.get("email") or ""),
+        email=export_email,
         output_dir=output_dir,
         now=now,
     )
@@ -916,6 +1517,7 @@ def export_workspace_cpa_session_from_browser(
         "path": str(path),
         "workspace_id": workspace_id,
         "session_url": session_url,
+        "switch_method": str(api_switch_result.get("method") or "ui" if workspace_id else "session"),
         "email": cpa_json.get("email", ""),
         "account_id": cpa_json.get("account_id", ""),
         "expired": cpa_json.get("expired", ""),

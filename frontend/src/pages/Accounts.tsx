@@ -33,7 +33,7 @@ const BROWSER_MODE_OPTIONS = [
 ]
 
 const ACCOUNT_TOOL_BUTTON_CLASS = 'h-8 shrink-0 whitespace-nowrap bg-transparent'
-const DEFAULT_CHATGPT_WORKSPACE_IDS = 'd1869eec-4d2d-4fce-967f-a1a6b906d51e'
+const DEFAULT_CHATGPT_WORKSPACE_IDS = 'ff598c4d-ccaf-40c1-bfaa-cb94565764b1\ncf8e512d-1f3b-4603-950c-3d9758a8b435\n47336c9d-7607-4478-b37c-018049af1e46\n59208eb6-ec43-4d87-9289-dbd9e250bdd6\n2c82c020-e1bc-4363-9502-a6794405f793\n9901799e-e832-48b1-9278-9abe73168708\nc72dcdb4-63a0-40b7-b0bb-ccce3ca54984\n2b636e76-a87b-4222-b536-2dc4a545109f\n4779b1d7-3109-4ecb-957f-80262f4d7161\nae67aa09-f3d3-4895-977d-9ca44ed1d996\n6daa08c1-59c8-4e06-9bc8-9d7246a63057\n521ffc8f-9612-4950-84ed-95773138eca6'
 
 function getAccountOverview(acc: any) {
   return acc?.overview || {}
@@ -218,6 +218,7 @@ function RegisterModal({
   // chatgpt 平台特定：注册成功后是否自动获取支付链接（保存到账号 cashier_url 字段，
   // 后续点"打开支付链接"直接复用）。仅当 platform === 'chatgpt' 时显示开关。
   const [autoPaymentLink, setAutoPaymentLink] = useState(false)
+  const [smsbowerManualActivations, setSmsbowerManualActivations] = useState('')
   const [chatgptWorkspaceIds, setChatgptWorkspaceIds] = useState(DEFAULT_CHATGPT_WORKSPACE_IDS)
   // GoPay 专属：PIN（6 位数字）、Hero-SMS API key、注册代理。仅当
   // platform === 'gopay' 时显示，未填时后端走环境变量回退。
@@ -364,6 +365,10 @@ function RegisterModal({
           throw new Error(t('accounts.missingDefaultMailbox'))
         }
         extra.mail_provider = defaultMailboxProvider.provider_key
+        if (platform === 'chatgpt' && ['smsbower_mail_api', 'smsbower_mail'].includes(defaultMailboxProvider.provider_key) && smsbowerManualActivations.trim()) {
+          extra.smsbower_mail_manual_activations = smsbowerManualActivations.trim()
+          extra.smsbower_mail_activation_wait_seconds = '0'
+        }
       }
       // GoPay 专属：手机号接码注册需要 PIN / API key / 代理
       if (platform === 'gopay') {
@@ -405,6 +410,8 @@ function RegisterModal({
           route: 'request',
           accept_invite: true,
           export_cpa_json: true,
+          request_concurrency: 4,
+          retry_backoff_ms: 1500,
           invite_timeout: 240,
         }
       }
@@ -581,6 +588,20 @@ function RegisterModal({
                 {/* chatgpt 平台特定：注册成功后自动获取支付链接（cashier_url）写回账号 extra */}
                 {platform === 'chatgpt' && (
                   <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-hover)] px-4 py-3 space-y-3">
+                    {selection.identityProvider === 'mailbox' && ['smsbower_mail_api', 'smsbower_mail'].includes(String(defaultMailboxProvider?.provider_key || '')) ? (
+                      <div>
+                        <label className="text-xs text-[var(--text-muted)] block mb-1">本次手动邮箱 activation</label>
+                        <textarea
+                          value={smsbowerManualActivations}
+                          onChange={(e) => setSmsbowerManualActivations(e.target.value)}
+                          placeholder="email@gmail.com----11686414"
+                          className="control-surface control-surface-compact w-full min-h-20 font-mono text-xs"
+                        />
+                        <div className="mt-1 text-xs text-[var(--text-muted)]">
+                          只对本次注册生效。一行一个，格式为 邮箱----mailId；填写后会直接用该 mailId 接验证码，不再等待 SMSBower 买邮箱库存。
+                        </div>
+                      </div>
+                    ) : null}
                     <label className="flex items-start gap-2 cursor-pointer">
                       <input
                         type="checkbox"
