@@ -150,9 +150,16 @@ def _create_api_mailbox(extra: dict, proxy: str | None) -> BaseMailbox:
     )
 
 
+def _create_yyds_mailbox(extra: dict, proxy: str | None) -> BaseMailbox:
+    from core.yyds_mailbox import YYDSMailbox
+
+    return YYDSMailbox.from_config({**dict(extra or {}), "proxy": proxy})
+
+
 MAILBOX_FACTORY_REGISTRY = {
     "local_ms_pool": _create_local_ms_pool,
     "api_mailbox": _create_api_mailbox,
+    "yyds_mail_api": _create_yyds_mailbox,
 }
 
 

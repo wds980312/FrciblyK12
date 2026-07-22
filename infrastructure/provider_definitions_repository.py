@@ -9,7 +9,7 @@ from core.db import ProviderDefinitionModel, ProviderSettingModel, engine
 
 logger = logging.getLogger(__name__)
 
-SUPPORTED_MAILBOX_PROVIDER_KEYS = ("local_ms_pool", "api_mailbox")
+SUPPORTED_MAILBOX_PROVIDER_KEYS = ("local_ms_pool", "api_mailbox", "yyds_mail_api")
 
 
 def _utcnow() -> datetime:
@@ -112,6 +112,61 @@ _BUILTIN_DEFINITIONS: list[dict] = [
                 "type": "toggle",
                 "category": "connection",
                 "hint": "测试时可开启；批量注册建议关闭。",
+            },
+        ],
+    },
+    {
+        "provider_type": "mailbox",
+        "provider_key": "yyds_mail_api",
+        "label": "YYDS Mail（vip.215.im）",
+        "description": "YYDS 临时邮箱 API，自动创建邮箱并轮询 ChatGPT 验证码",
+        "driver_type": "yyds_mail_api",
+        "default_auth_mode": "apikey",
+        "enabled": True,
+        "category": "thirdparty",
+        "auth_modes": [
+            {"value": "apikey", "label": "API Key"},
+            {"value": "jwt", "label": "JWT"},
+        ],
+        "fields": [
+            {
+                "key": "yyds_api_url",
+                "label": "API 地址",
+                "placeholder": "https://maliapi.215.im/v1",
+                "default_value": "https://maliapi.215.im/v1",
+                "category": "connection",
+            },
+            {
+                "key": "yyds_api_key",
+                "label": "API Key",
+                "secret": True,
+                "category": "auth",
+            },
+            {
+                "key": "yyds_jwt",
+                "label": "JWT（可选）",
+                "secret": True,
+                "category": "auth",
+            },
+            {
+                "key": "yyds_domain",
+                "label": "邮箱域名（可选）",
+                "placeholder": "留空则自动优先使用自有域名",
+                "category": "connection",
+            },
+            {
+                "key": "yyds_poll_interval",
+                "label": "轮询间隔秒",
+                "placeholder": "3",
+                "default_value": "3",
+                "category": "connection",
+            },
+            {
+                "key": "yyds_request_timeout",
+                "label": "单次请求超时秒",
+                "placeholder": "15",
+                "default_value": "15",
+                "category": "connection",
             },
         ],
     },
