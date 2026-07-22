@@ -5,13 +5,20 @@ import re
 import time
 from typing import Any
 
-import requests
+from curl_cffi import requests as cffi_requests
 
 from core.base_mailbox import BaseMailbox, MailboxAccount
 
 
 DEFAULT_API_URL = "https://maliapi.215.im/v1"
 DEFAULT_CODE_PATTERN = r"(?<!#)(?<!\d)(\d{6})(?!\d)"
+DEFAULT_IMPERSONATE = "chrome120"
+RETRYABLE_ERROR_MARKERS = (
+    "UNEXPECTED_EOF_WHILE_READING",
+    "EOF occurred in violation of protocol",
+    "SSLEOFError",
+    "Connection aborted",
+)
 
 
 def _truthy(value: object) -> bool:
@@ -44,7 +51,7 @@ class YYDSMailbox(BaseMailbox):
         poll_interval: float | str = 3,
         request_timeout: float | str = 15,
         proxy: str | None = None,
-        session: requests.Session | None = None,
+        session: Any | None = None,
     ):
         self.api_url = str(api_url or DEFAULT_API_URL).strip().rstrip("/")
         self.api_key = str(api_key or "").strip()
@@ -53,7 +60,11 @@ class YYDSMailbox(BaseMailbox):
         self.poll_interval = max(0.0, float(3 if poll_interval in (None, "") else poll_interval))
         self.request_timeout = max(1.0, float(15 if request_timeout in (None, "") else request_timeout))
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
-        self.session = session or requests.Session()
+        self.session = session or self._new_session()
+
+    @staticmethod
+    def _new_session():
+        return cffi_requests.Session(impersonate=DEFAULT_IMPERSONATE)
 
     @classmethod
     def from_config(cls, config: dict) -> "YYDSMailbox":
@@ -89,6 +100,24 @@ class YYDSMailbox(BaseMailbox):
             kwargs["json"] = json
         return kwargs
 
+    def _request(self, method: str, url: str, **kwargs):
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                request = getattr(self.session, method)
+                return request(url, **kwargs)
+            except Exception as exc:
+                last_exc = exc
+                message = str(exc)
+                retryable = any(marker in message for marker in RETRYABLE_ERROR_MARKERS)
+                if not retryable or attempt >= 2:
+                    raise
+                self.session = self._new_session()
+                time.sleep(0.5 * (attempt + 1))
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("YYDS 请求失败")
+
     def get_email(self) -> MailboxAccount:
         if not self.api_key and not self.jwt:
             raise RuntimeError("YYDS 邮箱未配置 API Key 或 JWT")
@@ -99,7 +128,8 @@ class YYDSMailbox(BaseMailbox):
 
         headers = self._auth_headers()
         headers["Content-Type"] = "application/json"
-        response = self.session.post(
+        response = self._request(
+            "post",
             f"{self.api_url}/accounts",
             **self._request_kwargs(headers=headers, json=payload),
         )
@@ -141,7 +171,8 @@ class YYDSMailbox(BaseMailbox):
     def _fetch_token(self, address: str) -> str:
         headers = self._auth_headers()
         headers["Content-Type"] = "application/json"
-        response = self.session.post(
+        response = self._request(
+            "post",
             f"{self.api_url}/token",
             **self._request_kwargs(headers=headers, json={"address": address}),
         )
@@ -149,7 +180,8 @@ class YYDSMailbox(BaseMailbox):
         return str(_payload_data(response.json()).get("token") or "").strip()
 
     def _list_messages(self, account: MailboxAccount) -> list[dict]:
-        response = self.session.get(
+        response = self._request(
+            "get",
             f"{self.api_url}/messages",
             **self._request_kwargs(
                 headers=self._auth_headers(token=account.account_id),
@@ -162,7 +194,8 @@ class YYDSMailbox(BaseMailbox):
         return messages if isinstance(messages, list) else []
 
     def _message_detail(self, account: MailboxAccount, message_id: str) -> dict:
-        response = self.session.get(
+        response = self._request(
+            "get",
             f"{self.api_url}/messages/{message_id}",
             **self._request_kwargs(
                 headers=self._auth_headers(token=account.account_id),

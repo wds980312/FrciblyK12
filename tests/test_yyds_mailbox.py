@@ -65,7 +65,7 @@ class FakeSession:
 
 
 def test_yyds_provider_definition_and_factory_are_wired(monkeypatch):
-    monkeypatch.setattr("requests.Session", lambda: FakeSession())
+    monkeypatch.setattr("core.yyds_mailbox.YYDSMailbox._new_session", lambda self: FakeSession())
     ProviderDefinitionsRepository().ensure_seeded()
 
     definition = ProviderDefinitionsRepository().get_by_key("mailbox", "yyds_mail_api")
