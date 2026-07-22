@@ -260,6 +260,66 @@ def upload_to_cpa(
         return False, f"上传异常: {str(e)}"
 
 
+def upload_agent_identity_to_cpa(
+    export_data: dict,
+    *,
+    filename: str,
+    api_url: str = None,
+    api_key: str = None,
+) -> Tuple[bool, str]:
+    """上传 Agent Identity Sub2API 导出 JSON 到 CPA/Sub2 auth-files。"""
+    if not api_url:
+        api_url = _get_config_value("cpa_api_url")
+    if not api_key:
+        api_key = _get_config_value("cpa_api_key")
+    if not api_url:
+        return False, "CPA API URL 未配置"
+    if not isinstance(export_data, dict):
+        return False, "Agent Identity 导出内容不是 JSON 对象"
+    if export_data.get("auth_mode") != "agentIdentity":
+        return False, "Agent Identity 导出内容缺少 auth_mode=agentIdentity"
+
+    upload_url = f"{api_url.rstrip('/')}/v0/management/auth-files"
+    file_content = json.dumps(export_data, ensure_ascii=False, separators=(",", ":"))
+    headers = {
+        "Authorization": f"Bearer {api_key or ''}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info(f"[CPA] 上传 Agent Identity: filename={filename}")
+
+    try:
+        from urllib.parse import quote
+
+        target_url = f"{upload_url}?name={quote(filename)}"
+        response = cffi_requests.post(
+            target_url,
+            headers=headers,
+            data=file_content.encode("utf-8"),
+            proxies=None,
+            verify=False,
+            timeout=30,
+            impersonate="chrome110",
+        )
+        if response.status_code in (200, 201, 207):
+            return True, "上传成功"
+        error_msg = f"上传失败: HTTP {response.status_code}"
+        try:
+            error_detail = response.json()
+            if isinstance(error_detail, dict):
+                error_msg = (
+                    error_detail.get("message")
+                    or error_detail.get("detail")
+                    or error_msg
+                )
+        except Exception:
+            error_msg = f"{error_msg} - {response.text[:200]}"
+        return False, error_msg
+    except Exception as e:
+        logger.error(f"Agent Identity CPA 上传异常: {e}")
+        return False, f"上传异常: {str(e)}"
+
+
 def upload_to_team_manager(
     account, api_url: str = None, api_key: str = None,
 ) -> Tuple[bool, str]:

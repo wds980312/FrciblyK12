@@ -320,6 +320,7 @@ function RegisterModal({
       const extra: Record<string, any> = {
         identity_provider: selection.identityProvider,
         auto_download_agent_identity: autoDownloadAgentIdentity,
+        auto_upload_agent_identity_cpa: autoDownloadAgentIdentity,
       }
       if (selection.identityProvider === 'mailbox') {
         if (selection.executorType === 'protocol') {
@@ -371,26 +372,25 @@ function RegisterModal({
     })
     try {
       const task = await apiFetch(`/tasks/${taskId}`)
-      const accountIds = task?.data?.account_ids || task?.result?.data?.account_ids || []
+      const resultData = task?.data || task?.result?.data || {}
+      const accountIds = resultData.account_ids || []
+      const uploads = Array.isArray(resultData.agent_identity_uploads)
+        ? resultData.agent_identity_uploads
+        : []
       if (!Array.isArray(accountIds) || accountIds.length === 0) {
         throw new Error(t('accounts.agentIdentityNoSuccessfulAccounts'))
       }
-
-      const { blob, filename } = await apiDownload(
-        '/accounts/export/sub2api-agent-identity',
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            platform: 'chatgpt',
-            ids: accountIds,
-            select_all: false,
-          }),
-        },
-      )
-      triggerBrowserDownload(blob, filename)
+      if (uploads.length === 0) {
+        throw new Error(t('accounts.agentIdentityUploadNoResult'))
+      }
+      const failedUploads = uploads.filter((item: any) => !item?.ok)
+      if (failedUploads.length > 0) {
+        const firstMessage = failedUploads[0]?.message || t('accounts.agentIdentityUploadFailed')
+        throw new Error(`${failedUploads.length}/${uploads.length} ${firstMessage}`)
+      }
       setAgentIdentityDownload({
         state: 'success',
-        message: t('accounts.agentIdentityExported'),
+        message: `${t('accounts.agentIdentityExported')} (${uploads.length})`,
       })
     } catch (error: any) {
       const detail = error?.message || String(error)

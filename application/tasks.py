@@ -21,7 +21,10 @@ from core.datetime_utils import format_local_clock, serialize_datetime
 from core.db import AccountModel, TaskEventModel, TaskModel, engine, save_account
 from core.platform_accounts import build_platform_account
 from core.registry import get
+from application.account_exports import AccountExportsService
+from domain.accounts import AccountExportSelection
 from infrastructure.platform_runtime import PlatformRuntime
+from platforms.chatgpt.cpa_upload import upload_agent_identity_to_cpa
 
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
@@ -572,6 +575,43 @@ def _resolve_registration_proxy_for_platform(
     return normalized_explicit_proxy or proxy_getter()
 
 
+def _artifact_json_content(content: Any) -> dict:
+    if hasattr(content, "getvalue"):
+        content = content.getvalue()
+    if isinstance(content, bytes):
+        content = content.decode("utf-8")
+    if isinstance(content, str):
+        data = json.loads(content)
+    elif isinstance(content, dict):
+        data = content
+    else:
+        raise ValueError("Agent Identity 导出内容不是可上传 JSON")
+    if not isinstance(data, dict):
+        raise ValueError("Agent Identity 导出内容不是 JSON 对象")
+    return data
+
+
+def _upload_registered_agent_identity(account_id: int) -> dict[str, Any]:
+    artifact = AccountExportsService().export_chatgpt_agent_identity_sub2api(
+        AccountExportSelection(
+            platform="chatgpt",
+            ids=[account_id],
+            select_all=False,
+        )
+    )
+    export_data = _artifact_json_content(artifact.content)
+    ok, message = upload_agent_identity_to_cpa(
+        export_data,
+        filename=artifact.filename,
+    )
+    return {
+        "account_id": account_id,
+        "ok": bool(ok),
+        "message": message,
+        "filename": artifact.filename,
+    }
+
+
 def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     from core.proxy_pool import proxy_pool
 
@@ -637,12 +677,41 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             saved_account_id = int(saved_account.id)
             if resolved_proxy:
                 proxy_pool.report_success(resolved_proxy)
+            agent_identity_upload = None
+            if bool(extra.get("auto_download_agent_identity")) or bool(
+                extra.get("auto_upload_agent_identity_cpa")
+            ):
+                logger.log(f"{account.email}: 开始自动上传 Agent Identity 到 Sub2/CPA")
+                try:
+                    agent_identity_upload = _upload_registered_agent_identity(saved_account_id)
+                    if agent_identity_upload.get("ok"):
+                        logger.log(f"{account.email}: Agent Identity 上传成功")
+                    else:
+                        logger.log(
+                            f"{account.email}: Agent Identity 上传失败: "
+                            f"{agent_identity_upload.get('message', '')}",
+                            level="warning",
+                        )
+                except Exception as upload_exc:
+                    agent_identity_upload = {
+                        "account_id": saved_account_id,
+                        "ok": False,
+                        "message": str(upload_exc),
+                        "filename": "",
+                    }
+                    logger.log(
+                        f"{account.email}: Agent Identity 上传异常: {upload_exc}",
+                        level="warning",
+                    )
             logger.record_success()
             logger.log(f"注册成功: {account.email}")
-            return {
+            result = {
                 "account_id": saved_account_id,
                 "email": account.email,
             }
+            if agent_identity_upload is not None:
+                result["agent_identity_upload"] = agent_identity_upload
+            return result
         except Exception as exc:
             if resolved_proxy:
                 proxy_pool.report_fail(resolved_proxy)
@@ -685,6 +754,15 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             "auto_download_agent_identity": bool(
                 extra.get("auto_download_agent_identity")
             ),
+            "auto_upload_agent_identity_cpa": bool(
+                extra.get("auto_upload_agent_identity_cpa")
+                or extra.get("auto_download_agent_identity")
+            ),
+            "agent_identity_uploads": [
+                item["agent_identity_upload"]
+                for item in registered_accounts
+                if isinstance(item.get("agent_identity_upload"), dict)
+            ],
         }
     )
     logger.log(f"完成: 成功 {success} 个, 失败 {len(errors)} 个", event_type="summary")

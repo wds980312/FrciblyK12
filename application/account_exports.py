@@ -198,13 +198,17 @@ def _make_sub2api_json(item: AccountRecord) -> dict:
     }
 
 
-def _make_agent_identity_sub2api_json(item: AccountRecord) -> dict:
-    payload = _chatgpt_export_payload(item)
-    access_token = str(payload.get("access_token") or "").strip()
-    id_token = str(payload.get("id_token") or "").strip()
+def make_agent_identity_sub2api_json_from_tokens(
+    *,
+    email: str,
+    access_token: str,
+    id_token: str = "",
+) -> dict:
+    access_token = str(access_token or "").strip()
+    id_token = str(id_token or "").strip()
     if not access_token:
         raise ValueError(
-            f"账号 {item.email} 缺少 access_token，无法注册 Agent Identity"
+            f"账号 {email} 缺少 access_token，无法注册 Agent Identity"
         )
 
     identity_token = ""
@@ -219,7 +223,7 @@ def _make_agent_identity_sub2api_json(item: AccountRecord) -> dict:
             break
     if not identity_token:
         raise ValueError(
-            f"账号 {item.email} 的 OAuth token 缺少 Agent Identity 所需账户 claims"
+            f"账号 {email} 的 OAuth token 缺少 Agent Identity 所需账户 claims"
         )
 
     try:
@@ -243,7 +247,16 @@ def _make_agent_identity_sub2api_json(item: AccountRecord) -> dict:
         )
         return certificate_to_sub2api_export(certificate)
     except AgentIdentityError as exc:
-        raise ValueError(f"账号 {item.email} 注册 Agent Identity 失败：{exc}") from exc
+        raise ValueError(f"账号 {email} 注册 Agent Identity 失败：{exc}") from exc
+
+
+def _make_agent_identity_sub2api_json(item: AccountRecord) -> dict:
+    payload = _chatgpt_export_payload(item)
+    return make_agent_identity_sub2api_json_from_tokens(
+        email=str(payload.get("email") or item.email),
+        access_token=str(payload.get("access_token") or ""),
+        id_token=str(payload.get("id_token") or ""),
+    )
 
 
 def _make_cockpit_token(item: AccountRecord) -> dict:

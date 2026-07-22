@@ -209,6 +209,11 @@ class ChatGPTPlatform(BasePlatform):
         return [
             {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
             {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
+            {"id": "upload_agent_identity_cpa", "label": "上传 Agent Identity",
+             "params": [
+                 {"key": "api_url", "label": "CPA API URL", "type": "text"},
+                 {"key": "api_key", "label": "CPA API Key", "type": "text"},
+             ]},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
                  {"key": "api_url", "label": "CPA API URL", "type": "text"},
@@ -299,6 +304,23 @@ class ChatGPTPlatform(BasePlatform):
                                     api_key=params.get("api_key"))
             return {"ok": ok, "data": msg}
 
+        if action_id == "upload_agent_identity_cpa":
+            from application.account_exports import make_agent_identity_sub2api_json_from_tokens
+            from platforms.chatgpt.cpa_upload import upload_agent_identity_to_cpa
+
+            export_data = make_agent_identity_sub2api_json_from_tokens(
+                email=a.email,
+                access_token=a.access_token,
+                id_token=a.id_token,
+            )
+            ok, msg = upload_agent_identity_to_cpa(
+                export_data,
+                filename=f"{a.email}_agent_identity_sub2api.json",
+                api_url=params.get("api_url"),
+                api_key=params.get("api_key"),
+            )
+            return {"ok": ok, "data": msg}
+
         if action_id == "upload_tm":
             from platforms.chatgpt.cpa_upload import upload_to_team_manager
             ok, msg = upload_to_team_manager(a, api_url=params.get("api_url"),
@@ -330,4 +352,3 @@ class ChatGPTPlatform(BasePlatform):
         data["local_app_account"] = read_current_codex_account()
         data["desktop_app_state"] = get_codex_desktop_state()
         return {"ok": True, "data": data}
-
