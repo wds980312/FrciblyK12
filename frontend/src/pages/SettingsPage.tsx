@@ -212,6 +212,45 @@ function GeneralTab({
         </div>
       </SettingGroup>
 
+      <SettingGroup
+        title="Sub2API"
+        desc="Agent Identity 自动导入目标。API URL 默认可用，Auth Token 使用 Sub2API 管理端登录后的 Bearer token。"
+      >
+        <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-card)] divide-y divide-[var(--border)]/50">
+          <SettingRow label="API URL">
+            <input
+              value={form.sub2api_api_url || "http://host.docker.internal:18080/api/v1"}
+              onChange={(e) =>
+                setForm((f) => ({ ...f, sub2api_api_url: e.target.value }))
+              }
+              className="control-surface w-full"
+              placeholder="http://host.docker.internal:18080/api/v1"
+            />
+          </SettingRow>
+          <SettingRow label="Auth Token">
+            <input
+              type="password"
+              value={form.sub2api_auth_token || ""}
+              onChange={(e) =>
+                setForm((f) => ({ ...f, sub2api_auth_token: e.target.value }))
+              }
+              className="control-surface w-full"
+              placeholder="Bearer token"
+            />
+          </SettingRow>
+          <SettingRow label="默认分组">
+            <input
+              value={form.sub2api_default_group || ""}
+              onChange={(e) =>
+                setForm((f) => ({ ...f, sub2api_default_group: e.target.value }))
+              }
+              className="control-surface w-full"
+              placeholder="free 或 9，留空则不自动绑定"
+            />
+          </SettingRow>
+        </div>
+      </SettingGroup>
+
       <Button onClick={save} disabled={saving} className="w-full">
         <Save className="mr-2 h-4 w-4" />
         {saved

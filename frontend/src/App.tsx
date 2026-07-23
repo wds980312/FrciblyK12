@@ -13,7 +13,6 @@ import Dashboard from "@/pages/Dashboard";
 import Accounts from "@/pages/Accounts";
 import SettingsPage from "@/pages/SettingsPage";
 import UpdateBanner from "@/components/UpdateBanner";
-import WelcomeDialog from "@/components/WelcomeDialog";
 import {
   LayoutDashboard,
   Moon,
@@ -237,7 +236,6 @@ function Shell({
 
   return (
     <div className="flex h-screen overflow-hidden bg-[var(--bg-base)]">
-      <WelcomeDialog />
       <Sidebar
         theme={theme}
         toggleTheme={toggleTheme}

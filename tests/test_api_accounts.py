@@ -10,6 +10,9 @@ from core.base_platform import Account
 from core.db import save_account
 from domain.accounts import AccountExportSelection, AccountQuery
 from infrastructure.accounts_repository import AccountsRepository
+from sqlmodel import Session, select
+from core.account_graph import patch_account_graph
+from core.db import AccountModel, AccountOverviewModel, engine
 
 
 def _make_jwt(payload: dict) -> str:
@@ -100,6 +103,78 @@ def test_delete_account(client):
     assert get_resp.status_code == 404
 
 
+def _create_account_with_status(email: str, *, platform: str = "chatgpt", lifecycle_status: str = "registered", valid: bool = True) -> int:
+    with Session(engine) as session:
+        model = AccountModel(platform=platform, email=email, password="secret")
+        session.add(model)
+        session.commit()
+        session.refresh(model)
+        patch_account_graph(
+            session,
+            model,
+            lifecycle_status=lifecycle_status,
+            summary_updates={"valid": valid},
+        )
+        session.commit()
+        return int(model.id or 0)
+
+
+def test_preview_cleanup_invalid_chatgpt_accounts(client, monkeypatch):
+    invalid_id = _create_account_with_status("bad@test.com", valid=False)
+    valid_id = _create_account_with_status("good@test.com", valid=True)
+
+    monkeypatch.setattr(
+        "application.accounts.find_sub2api_accounts_by_emails",
+        lambda emails: {
+            "bad@test.com": [{"id": 101, "name": "bad@test.com"}],
+        },
+    )
+    monkeypatch.setattr("application.accounts.get_sub2api_config_error", lambda: "")
+
+    resp = client.post("/api/accounts/cleanup-invalid/preview", json={"include_sub2api": True})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["local_count"] == 1
+    assert data["sub2api_count"] == 1
+    assert data["accounts"] == [{"id": invalid_id, "email": "bad@test.com"}]
+    assert data["sub2api_matches"]["bad@test.com"][0]["id"] == 101
+    assert AccountsRepository().get(valid_id) is not None
+
+
+def test_cleanup_invalid_chatgpt_accounts_deletes_local_and_sub2(client, monkeypatch):
+    invalid_id = _create_account_with_status("bad@test.com", valid=False)
+    valid_id = _create_account_with_status("good@test.com", valid=True)
+    deleted: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        "application.accounts.find_sub2api_accounts_by_emails",
+        lambda emails: {
+            "bad@test.com": [{"id": 101, "name": "bad@test.com"}],
+        },
+    )
+    monkeypatch.setattr("application.accounts.get_sub2api_config_error", lambda: "")
+    monkeypatch.setattr(
+        "application.accounts.delete_sub2api_account",
+        lambda account_id: deleted.append(("deleted", account_id)) or (True, "ok"),
+    )
+
+    resp = client.post("/api/accounts/cleanup-invalid", json={"include_sub2api": True})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["deleted_local"] == 1
+    assert data["deleted_sub2api"] == 1
+    assert data["sub2api_errors"] == []
+    assert deleted == [("deleted", 101)]
+    assert AccountsRepository().get(invalid_id) is None
+    assert AccountsRepository().get(valid_id) is not None
+    with Session(engine) as session:
+        assert session.exec(
+            select(AccountOverviewModel).where(AccountOverviewModel.account_id == invalid_id)
+        ).first() is None
+
+
 def test_update_account(client):
     account_id = _create_account()
     patch_resp = client.patch(
@@ -116,6 +191,46 @@ def test_filter_accounts_by_platform(client):
     data = resp.json()
     assert data["total"] == 1
     assert data["items"][0]["platform"] == "cursor"
+
+
+def test_list_accounts_paginates_before_loading_account_graphs(client, monkeypatch):
+    _create_account(platform="chatgpt", email="first@test.com")
+    _create_account(platform="chatgpt", email="second@test.com")
+    _create_account(platform="chatgpt", email="third@test.com")
+
+    repository = AccountsRepository()
+    original_load = repository._load_records
+    loaded_counts: list[int] = []
+
+    def capture_loaded_models(session, models):
+        loaded_counts.append(len(models))
+        return original_load(session, models)
+
+    monkeypatch.setattr(repository, "_load_records", capture_loaded_models)
+    total, items = repository.list(
+        AccountQuery(platform="chatgpt", page=2, page_size=1),
+    )
+
+    assert total == 3
+    assert [item.email for item in items] == ["second@test.com"]
+    assert loaded_counts == [1]
+
+
+def test_filter_accounts_by_status_is_paginated_in_database(client):
+    _create_account_with_status("valid-one@test.com", valid=True)
+    _create_account_with_status("invalid-one@test.com", valid=False)
+    _create_account_with_status("valid-two@test.com", valid=True)
+    _create_account_with_status("invalid-two@test.com", valid=False)
+
+    response = client.get(
+        "/api/accounts",
+        params={"platform": "chatgpt", "status": "invalid", "page": 2, "page_size": 1},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["total"] == 2
+    assert [item["email"] for item in data["items"]] == ["invalid-one@test.com"]
 
 
 def test_account_stats(client):

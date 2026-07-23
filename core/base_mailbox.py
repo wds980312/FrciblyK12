@@ -18,6 +18,9 @@ class MailboxAccount:
 
 
 class BaseMailbox(ABC):
+    def set_activity_callback(self, callback) -> None:
+        """Optional heartbeat hook used by long-running registration workers."""
+
     @abstractmethod
     def get_email(self) -> MailboxAccount:
         """获取一个可用邮箱。"""
@@ -76,6 +79,10 @@ class FallbackMailbox(BaseMailbox):
             except Exception as exc:
                 errors.append(f"{key}: {exc}")
         raise RuntimeError("所有邮箱 provider 均创建失败: " + " | ".join(errors))
+
+    def set_activity_callback(self, callback) -> None:
+        for _, mailbox in self.providers:
+            mailbox.set_activity_callback(callback)
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         return self._resolve(account).get_current_ids(account)

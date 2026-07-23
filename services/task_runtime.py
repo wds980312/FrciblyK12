@@ -56,11 +56,17 @@ class TaskRuntime:
                         running_platform_counts[state.platform] = running_platform_counts.get(state.platform, 0) + 1
                     busy_account_keys.update(state.account_keys)
             while available_slots > 0 and self._running:
-                task_info = claim_next_runnable_task(
-                    running_platform_counts=running_platform_counts,
-                    busy_account_keys=busy_account_keys,
-                    max_parallel_per_platform=self.max_parallel_per_platform,
-                )
+                try:
+                    task_info = claim_next_runnable_task(
+                        running_platform_counts=running_platform_counts,
+                        busy_account_keys=busy_account_keys,
+                        max_parallel_per_platform=self.max_parallel_per_platform,
+                    )
+                except Exception as exc:
+                    # SQLite can briefly reject a concurrent state update.
+                    # Keep the dispatcher alive and retry on the next poll.
+                    print(f"[TaskRuntime] 领取任务失败，将重试: {exc}")
+                    break
                 if not task_info:
                     break
                 task_id = task_info["id"]

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from application.account_exports import AccountExportsService, ExportArtifact
 from application.accounts import AccountsService
+from application.tasks import get_chatgpt_pool_status
 from domain.accounts import AccountExportSelection, AccountQuery, AccountUpdateCommand
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -46,6 +47,10 @@ class BatchExportRequest(BaseModel):
     search_filter: Optional[str] = None
 
 
+class CleanupInvalidRequest(BaseModel):
+    include_sub2api: bool = True
+
+
 def _stream_artifact(artifact: ExportArtifact) -> StreamingResponse:
     if isinstance(artifact.content, io.BytesIO):
         body = artifact.content
@@ -74,6 +79,11 @@ def list_accounts(
 @router.get("/stats")
 def get_stats():
     return service.get_stats()
+
+
+@router.get("/chatgpt/pool-status")
+def get_chatgpt_pool_status_endpoint():
+    return get_chatgpt_pool_status()
 
 
 @router.post("/export/json")
@@ -181,6 +191,16 @@ def export_accounts_any2api(body: BatchExportRequest):
 @router.post("/import")
 def import_accounts(body: ImportRequest):
     return service.import_accounts(body.platform, body.lines)
+
+
+@router.post("/cleanup-invalid/preview")
+def preview_cleanup_invalid_accounts(body: CleanupInvalidRequest):
+    return service.preview_cleanup_invalid_chatgpt(include_sub2api=body.include_sub2api)
+
+
+@router.post("/cleanup-invalid")
+def cleanup_invalid_accounts(body: CleanupInvalidRequest):
+    return service.cleanup_invalid_chatgpt(include_sub2api=body.include_sub2api)
 
 
 @router.get("/{account_id}")

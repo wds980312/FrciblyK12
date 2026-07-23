@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from sqlalchemy import UniqueConstraint, inspect
+from sqlalchemy import UniqueConstraint, event, inspect
 from sqlmodel import Field, SQLModel, Session, create_engine, select
 
 
@@ -19,7 +19,19 @@ def _default_database_url() -> str:
 
 
 DATABASE_URL = os.getenv("ACCOUNT_MANAGER_DATABASE_URL", _default_database_url())
-engine = create_engine(DATABASE_URL)
+_is_sqlite = DATABASE_URL.startswith("sqlite")
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False, "timeout": 30} if _is_sqlite else {},
+)
+
+
+if _is_sqlite:
+    @event.listens_for(engine, "connect")
+    def _configure_sqlite_connection(dbapi_connection, _connection_record):
+        # Background registration, task logging, and liveness checks can all
+        # write briefly. Wait for that transaction instead of failing fast.
+        dbapi_connection.execute("PRAGMA busy_timeout=30000")
 
 
 class AccountModel(SQLModel, table=True):
@@ -402,6 +414,11 @@ def _migrate_legacy_accounts_schema() -> None:
 
 
 def init_db():
+    if _is_sqlite:
+        # WAL allows readers to continue while the short-lived status writes
+        # from the independent account monitor are committed.
+        with engine.begin() as connection:
+            connection.exec_driver_sql("PRAGMA journal_mode=WAL")
     SQLModel.metadata.create_all(engine)
     from core.account_graph import sync_all_account_graphs
     from infrastructure.provider_definitions_repository import ProviderDefinitionsRepository

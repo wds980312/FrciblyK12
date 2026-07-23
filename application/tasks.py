@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -9,6 +13,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.account_graph import (
@@ -24,11 +29,15 @@ from core.registry import get
 from application.account_exports import AccountExportsService
 from domain.accounts import AccountExportSelection
 from infrastructure.platform_runtime import PlatformRuntime
-from platforms.chatgpt.cpa_upload import upload_agent_identity_to_cpa
+from platforms.chatgpt.sub2api_upload import (
+    probe_sub2api_account_model,
+    upload_agent_identity_to_sub2api,
+)
 
 TASK_TYPE_REGISTER = "register"
 TASK_TYPE_ACCOUNT_CHECK_ALL = "account_check_all"
 TASK_TYPE_PLATFORM_ACTION = "platform_action"
+TASK_TYPE_POOL_MAINTENANCE = "pool_maintenance"
 
 TASK_STATUS_PENDING = "pending"
 TASK_STATUS_CLAIMED = "claimed"
@@ -189,7 +198,8 @@ def create_task(
 
 def create_register_task(payload: dict[str, Any]) -> dict[str, Any]:
     count = max(int(payload.get("count", 1) or 1), 1)
-    payload = {**payload, "platform": "chatgpt"}
+    source = str(payload.get("source") or (payload.get("extra") or {}).get("source") or "")
+    payload = {**payload, "platform": "chatgpt", "source": source}
     return create_task(
         task_type=TASK_TYPE_REGISTER,
         platform="chatgpt",
@@ -207,10 +217,49 @@ def create_account_check_all_task(platform: str = "", limit: int = 50) -> dict[s
     )
 
 
+def has_queued_or_active_chatgpt_work() -> bool:
+    task_types = {TASK_TYPE_REGISTER, TASK_TYPE_ACCOUNT_CHECK_ALL, TASK_TYPE_POOL_MAINTENANCE}
+    unfinished = {TASK_STATUS_PENDING, *ACTIVE_TASK_STATUSES}
+    with Session(engine) as session:
+        task = session.exec(
+            select(TaskModel)
+            .where(TaskModel.platform == "chatgpt")
+            .where(TaskModel.type.in_(task_types))
+            .where(TaskModel.status.in_(unfinished))
+        ).first()
+    return task is not None
+
+
+def _is_automatic_pool_task(task: TaskModel) -> bool:
+    payload = task.get_payload()
+    return str(payload.get("source") or (payload.get("extra") or {}).get("source") or "") == "pool_maintenance"
+
+
+def create_pool_maintenance_task(*, target: int, concurrency: int = 1) -> dict[str, Any] | None:
+    if has_queued_or_active_chatgpt_work():
+        return None
+    return create_task(
+        task_type=TASK_TYPE_POOL_MAINTENANCE,
+        platform="chatgpt",
+        payload={
+            "platform": "chatgpt",
+            "target": max(int(target or 1), 1),
+            "concurrency": max(int(concurrency or 1), 1),
+            "source": "pool_maintenance",
+        },
+    )
+
+
 def create_platform_action_task(payload: dict[str, Any]) -> dict[str, Any]:
+    platform = str(payload.get("platform", ""))
+    if str(payload.get("action_id", "")) == "upload_agent_identity_cpa":
+        # Sub2API import only reads a saved account and calls the Sub2API
+        # management endpoint, so it should not wait behind long ChatGPT
+        # browser registration tasks.
+        platform = "sub2api_import"
     return create_task(
         task_type=TASK_TYPE_PLATFORM_ACTION,
-        platform=str(payload.get("platform", "")),
+        platform=platform,
         payload=payload,
         progress_total=1,
     )
@@ -220,6 +269,50 @@ def get_task(task_id: str) -> Optional[dict[str, Any]]:
     with Session(engine) as session:
         task = session.get(TaskModel, task_id)
         return serialize_task(task) if task else None
+
+
+def get_chatgpt_pool_status() -> dict[str, Any]:
+    from core.config_store import config_store
+
+    enabled = str(config_store.get("chatgpt_pool_maintenance_enabled", "") or "").lower() in {
+        "1", "true", "yes", "on",
+    }
+    try:
+        target = max(int(config_store.get("chatgpt_pool_target", "100") or 100), 1)
+    except (TypeError, ValueError):
+        target = 100
+
+    with Session(engine) as session:
+        accounts = session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "chatgpt")
+            .order_by(AccountModel.id)
+        ).all()
+        account_ids = [int(account.id or 0) for account in accounts if account.id]
+        graphs = load_account_graphs(session, account_ids)
+        invalid = sum(
+            1
+            for account_id in account_ids
+            if graphs.get(account_id, {}).get("validity_status") == "invalid"
+        )
+        active_task = session.exec(
+            select(TaskModel)
+            .where(TaskModel.platform == "chatgpt")
+            .where(TaskModel.type.in_({TASK_TYPE_REGISTER, TASK_TYPE_POOL_MAINTENANCE}))
+            .where(TaskModel.status.in_(ACTIVE_TASK_STATUSES | {TASK_STATUS_PENDING}))
+            .order_by(TaskModel.created_at.desc())
+        ).first()
+
+    usable = max(len(accounts) - invalid, 0)
+    return {
+        "enabled": enabled,
+        "target": target,
+        "total": len(accounts),
+        "usable": usable,
+        "invalid": invalid,
+        "shortfall": max(target - usable, 0),
+        "active_task": serialize_task(active_task) if active_task else None,
+    }
 
 
 def list_task_events(task_id: str, *, since: int = 0, limit: int = 200) -> list[dict[str, Any]]:
@@ -254,9 +347,8 @@ def append_task_event(task_id: str, message: str, *, event_type: str = "log", le
 def mark_incomplete_tasks_interrupted() -> None:
     interrupted_ids: list[str] = []
     with Session(engine) as session:
-        non_terminal = [TASK_STATUS_PENDING] + list(ACTIVE_TASK_STATUSES)
         tasks = session.exec(
-            select(TaskModel).where(TaskModel.status.in_(non_terminal))
+            select(TaskModel).where(TaskModel.status.in_(ACTIVE_TASK_STATUSES))
         ).all()
         for task in tasks:
             task.status = TASK_STATUS_INTERRUPTED
@@ -311,6 +403,8 @@ def claim_next_runnable_task(
             .where(TaskModel.status == TASK_STATUS_PENDING)
             .order_by(TaskModel.created_at)
         ).all()
+        # Manual work must never wait behind background pool maintenance.
+        tasks.sort(key=lambda item: (1 if _is_automatic_pool_task(item) else 0, item.created_at))
         for task in tasks:
             payload = task.get_payload()
             platform = task.platform or str(payload.get("platform", "") or "")
@@ -455,7 +549,14 @@ class TaskLogger:
         )
 
 
-def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger: TaskLogger, resolved_proxy: str | None = None, shared_mailbox=None):
+def _build_platform_instance(
+    platform_name: str,
+    payload: dict[str, Any],
+    logger: TaskLogger,
+    resolved_proxy: str | None = None,
+    shared_mailbox=None,
+    log_fn: Callable[..., None] | None = None,
+):
     from core.base_identity import normalize_identity_provider
     from core.base_mailbox import create_mailbox
 
@@ -483,30 +584,66 @@ def _build_platform_instance(platform_name: str, payload: dict[str, Any], logger
 
     platform_cls = get(platform_name)
     platform = platform_cls(config=config, mailbox=mailbox)
+    effective_log_fn = log_fn or logger.log
     if hasattr(platform, "set_logger"):
-        platform.set_logger(logger.log)
+        platform.set_logger(effective_log_fn)
     else:
-        platform._log_fn = logger.log
+        platform._log_fn = effective_log_fn
     return platform
 
 
-def _run_single_account_check(account_id: int, logger: TaskLogger | None = None) -> tuple[bool, dict[str, Any]]:
+def _run_single_account_check(
+    account_id: int,
+    logger: TaskLogger | None = None,
+    *,
+    model_probe_only: bool = False,
+) -> tuple[bool, dict[str, Any]]:
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
         if not model:
             raise ValueError("账号不存在")
-        plugin = get(model.platform)(config=RegisterConfig())
+        plugin = None
+        if not (model_probe_only and model.platform == "chatgpt"):
+            plugin = get(model.platform)(config=RegisterConfig())
         account = build_platform_account(session, model)
 
-    valid = plugin.check_valid(account)
+    # Pool liveness must be independent from the slower subscription query.
+    # For ChatGPT, the Sub2API gpt-5.5 request below is the authoritative test.
+    valid = True if model_probe_only and account.platform == "chatgpt" else plugin.check_valid(account)
     with Session(engine) as session:
         model = session.get(AccountModel, account_id)
         if model:
             model.updated_at = _utcnow()
             current_graph = load_account_graphs(session, [account_id]).get(account_id, {})
-            summary_updates = {"checked_at": _utcnow_iso(), "valid": bool(valid)}
-            if hasattr(plugin, "get_last_check_overview"):
+            summary_updates = {"checked_at": _utcnow_iso()}
+            if plugin and hasattr(plugin, "get_last_check_overview"):
                 summary_updates.update(plugin.get_last_check_overview() or {})
+            if model.platform == "chatgpt":
+                probe = probe_sub2api_account_model(model.email)
+                probe_status = str(probe.get("status") or "error")
+                summary_updates.update(
+                    {
+                        "model_probe_model": "gpt-5.5",
+                        "model_probe_prompt": "hi",
+                        "model_probe_status": probe_status,
+                        "model_probe_message": str(probe.get("message") or ""),
+                    }
+                )
+                if probe_status == "success":
+                    summary_updates["model_probe_failure_count"] = 0
+                    summary_updates["valid"] = True
+                    valid = True
+                elif probe_status == "failed":
+                    # A completed model request without a response means this
+                    # account cannot serve the pool, so remove it immediately.
+                    summary_updates["model_probe_failure_count"] = 1
+                    summary_updates["valid"] = False
+                    valid = False
+                else:
+                    # A failed network probe says nothing about the account.
+                    valid = current_graph.get("validity_status") != "invalid"
+            else:
+                summary_updates["valid"] = bool(valid)
             lifecycle_status = None
             if valid:
                 # **bug 修复**：原实现 ``recover_lifecycle_status_for_valid_account``
@@ -543,7 +680,12 @@ def execute_task(task_id: str) -> None:
         payload = task.get_payload()
 
     logger = TaskLogger(task_id)
-    logger.mark_running()
+    # Browser registration is delegated to a child process. Its parent has
+    # already claimed and marked this task running; writing that transition a
+    # second time races the dispatcher against the parent task state.
+    is_registration_child = os.environ.get("REGISTRATION_WORKER_CHILD") == "1"
+    if not is_registration_child:
+        logger.mark_running()
 
     if logger.is_cancel_requested():
         logger.finish(TASK_STATUS_CANCELLED, error="任务在启动后立即被取消")
@@ -553,6 +695,7 @@ def execute_task(task_id: str) -> None:
         TASK_TYPE_REGISTER: _execute_register_task,
         TASK_TYPE_ACCOUNT_CHECK_ALL: _execute_account_check_all_task,
         TASK_TYPE_PLATFORM_ACTION: _execute_platform_action_task,
+        TASK_TYPE_POOL_MAINTENANCE: _execute_pool_maintenance_task,
     }
     handler = handlers.get(task_type)
     if not handler:
@@ -600,19 +743,143 @@ def _upload_registered_agent_identity(account_id: int) -> dict[str, Any]:
         )
     )
     export_data = _artifact_json_content(artifact.content)
-    ok, message = upload_agent_identity_to_cpa(
+    ok, message = upload_agent_identity_to_sub2api(
         export_data,
-        filename=artifact.filename,
     )
     return {
         "account_id": account_id,
         "ok": bool(ok),
         "message": message,
         "filename": artifact.filename,
+        "target": "sub2api",
     }
 
 
+def _wait_for_registration_workers(
+    pending: set,
+    *,
+    timeout_seconds: int,
+    wait_fn=wait,
+) -> tuple[set, set]:
+    """Wait for one worker completion, reporting a batch only when it stalls."""
+    done, not_done = wait_fn(
+        pending,
+        timeout=max(int(timeout_seconds or 0), 1),
+        return_when=FIRST_COMPLETED,
+    )
+    return set(done), set(not_done) if not done else set()
+
+
+def _find_stalled_registration_workers(
+    pending_workers: dict[Any, int],
+    last_activity: dict[int, float],
+    *,
+    timeout_seconds: int,
+    now: float | None = None,
+) -> set:
+    """Return only workers that stopped making observable progress."""
+    current_time = time.monotonic() if now is None else now
+    timeout = max(int(timeout_seconds or 0), 1)
+    return {
+        future
+        for future, worker_index in pending_workers.items()
+        if current_time - last_activity.get(worker_index, current_time) >= timeout
+    }
+
+
+def _latest_task_event(task_id: str) -> TaskEventModel | None:
+    with Session(engine) as session:
+        return session.exec(
+            select(TaskEventModel)
+            .where(TaskEventModel.task_id == task_id)
+            .order_by(TaskEventModel.id.desc())
+        ).first()
+
+
+def _latest_task_event_monotonic_age(task_id: str, fallback: float) -> float:
+    """Return seconds since the task last emitted an event."""
+    event = _latest_task_event(task_id)
+    if not event or not event.created_at:
+        return time.monotonic() - fallback
+    created_at = event.created_at
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+    return max((_utcnow() - created_at).total_seconds(), 0.0)
+
+
+def _execute_register_task_in_child_process(payload: dict[str, Any], logger: TaskLogger) -> None:
+    """Run browser registration outside the task-runtime process.
+
+    Playwright/Camoufox can hang while cleaning up a disconnected driver. A
+    process group gives the parent a reliable way to reclaim that browser.
+    """
+    extra = dict(payload.get("extra") or {})
+    stall_timeout = max(int(extra.get("registration_process_stall_timeout", 45) or 45), 30)
+    child_env = dict(os.environ)
+    child_env["REGISTRATION_WORKER_CHILD"] = "1"
+    command = [
+        sys.executable,
+        "-c",
+        f"from core.registry import load_all; from application.tasks import execute_task; load_all(); execute_task({logger.task_id!r})",
+    ]
+    process = subprocess.Popen(command, env=child_env, start_new_session=True)
+    logger.log(f"浏览器注册进程已启动: pid={process.pid}")
+    while process.poll() is None:
+        if logger.is_cancel_requested():
+            break
+        latest_event = _latest_task_event(logger.task_id)
+        latest_message = str(latest_event.message if latest_event else "")
+        driver_failed = any(
+            marker in latest_message
+            for marker in (
+                "Connection closed while reading from the driver",
+                "ChatGPT NextAuth 注册入口失败",
+            )
+        )
+        stalled = _latest_task_event_monotonic_age(logger.task_id, time.monotonic()) >= stall_timeout
+        if driver_failed or stalled:
+            reason = "浏览器 driver 已断连" if driver_failed else f"浏览器注册进程无进展超过 {stall_timeout} 秒"
+            logger.log(
+                f"{reason}，正在强制回收",
+                level="error",
+            )
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait(timeout=5)
+            error = reason
+            logger.record_error(error)
+            logger.set_progress(1, 1)
+            logger.set_result_data({"success": 0, "fail": 1, "account_ids": [], "accounts": []})
+            if str(payload.get("source") or "") == "pool_maintenance":
+                _continue_auto_pool_registration(payload, TASK_STATUS_FAILED, logger)
+            logger.finish(TASK_STATUS_FAILED, error=error)
+            return
+        time.sleep(1)
+
+    if logger.is_cancel_requested():
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
+        return
+
+    # The child persists the final task state and all account data itself.
+    with Session(engine) as session:
+        task = session.get(TaskModel, logger.task_id)
+        if task and task.status in TERMINAL_TASK_STATUSES:
+            return
+    error = f"浏览器注册进程异常退出: exit={process.returncode}"
+    logger.record_error(error)
+    logger.finish(TASK_STATUS_FAILED, error=error)
+
+
 def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    if isinstance(logger, TaskLogger) and os.environ.get("REGISTRATION_WORKER_CHILD") != "1":
+        _execute_register_task_in_child_process(payload, logger)
+        return
     from core.proxy_pool import proxy_pool
 
     count = max(int(payload.get("count", 1) or 1), 1)
@@ -622,6 +889,10 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     password = payload.get("password") or None
     explicit_proxy = str(payload.get("proxy") or "").strip() or None
     extra = dict(payload.get("extra") or {})
+    worker_stall_timeout = max(
+        int(extra.get("registration_worker_stall_timeout", 90) or 90),
+        30,
+    )
     resolved_proxy = _resolve_registration_proxy_for_platform(
         platform_name,
         explicit_proxy=explicit_proxy,
@@ -636,10 +907,9 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
         return
 
-    shared_mailbox = None
+    identity_provider = ""
     try:
         from core.base_identity import normalize_identity_provider
-        from core.base_mailbox import create_mailbox
 
         identity_provider = normalize_identity_provider(extra.get("identity_provider", "mailbox"))
         if identity_provider == "mailbox":
@@ -647,31 +917,54 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 from infrastructure.provider_settings_repository import ProviderSettingsRepository
 
                 extra["mail_provider"] = ProviderSettingsRepository().get_default_provider_key("mailbox")
-            shared_mailbox = create_mailbox(
-                provider=extra.get("mail_provider", ""),
-                extra=extra,
-                proxy=resolved_proxy,
-            )
     except Exception as exc:
         logger.log(f"邮箱初始化失败: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=f"邮箱初始化失败: {exc}")
         return
 
+    worker_payload = {**payload, "extra": extra}
+    activity_lock = threading.Lock()
+    last_activity: dict[int, float] = {}
+
+    def _touch(worker_index: int) -> None:
+        with activity_lock:
+            last_activity[worker_index] = time.monotonic()
+
     def _do_one(index: int) -> dict[str, Any] | str:
         if logger.is_cancel_requested():
             return "__cancel_requested__"
         logger.set_subtask(f"worker_{index + 1}", f"Worker {index + 1}")
+
+        def _worker_log(message: str, **kwargs: Any) -> None:
+            _touch(index)
+            logger.log(message, **kwargs)
+
+        _touch(index)
         try:
+            mailbox = None
+            if identity_provider == "mailbox":
+                # curl_cffi Session is not thread-safe. Each browser worker needs
+                # its own mailbox client and TLS connection state.
+                from core.base_mailbox import create_mailbox
+
+                mailbox = create_mailbox(
+                    provider=extra.get("mail_provider", ""),
+                    extra=extra,
+                    proxy=resolved_proxy,
+                )
+                if hasattr(mailbox, "set_activity_callback"):
+                    mailbox.set_activity_callback(lambda: _touch(index))
             platform = _build_platform_instance(
                 platform_name,
-                payload,
+                worker_payload,
                 logger,
                 resolved_proxy=resolved_proxy,
-                shared_mailbox=shared_mailbox,
+                shared_mailbox=mailbox,
+                log_fn=_worker_log,
             )
-            logger.log(f"开始注册第 {index + 1}/{count} 个账号")
+            _worker_log(f"开始注册第 {index + 1}/{count} 个账号")
             if resolved_proxy:
-                logger.log(f"使用代理: {resolved_proxy}")
+                _worker_log(f"使用代理: {resolved_proxy}")
             account = platform.register(email=email, password=password)
             saved_account = save_account(account)
             saved_account_id = int(saved_account.id)
@@ -681,13 +974,13 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
             if bool(extra.get("auto_download_agent_identity")) or bool(
                 extra.get("auto_upload_agent_identity_cpa")
             ):
-                logger.log(f"{account.email}: 开始自动上传 Agent Identity 到 Sub2/CPA")
+                _worker_log(f"{account.email}: 开始自动导入 Agent Identity 到 Sub2API")
                 try:
                     agent_identity_upload = _upload_registered_agent_identity(saved_account_id)
                     if agent_identity_upload.get("ok"):
-                        logger.log(f"{account.email}: Agent Identity 上传成功")
+                        _worker_log(f"{account.email}: Agent Identity 已导入 Sub2API")
                     else:
-                        logger.log(
+                        _worker_log(
                             f"{account.email}: Agent Identity 上传失败: "
                             f"{agent_identity_upload.get('message', '')}",
                             level="warning",
@@ -699,12 +992,12 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                         "message": str(upload_exc),
                         "filename": "",
                     }
-                    logger.log(
+                    _worker_log(
                         f"{account.email}: Agent Identity 上传异常: {upload_exc}",
                         level="warning",
                     )
             logger.record_success()
-            logger.log(f"注册成功: {account.email}")
+            _worker_log(f"注册成功: {account.email}")
             result = {
                 "account_id": saved_account_id,
                 "email": account.email,
@@ -717,7 +1010,7 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
                 proxy_pool.report_fail(resolved_proxy)
             error = str(exc)
             logger.record_error(error)
-            logger.log(f"注册失败: {error}", level="error")
+            _worker_log(f"注册失败: {error}", level="error")
             return error
         finally:
             logger.clear_subtask()
@@ -726,24 +1019,56 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
     errors: list[str] = []
     registered_accounts: list[dict[str, Any]] = []
     completed = 0
+    pool = ThreadPoolExecutor(max_workers=concurrency)
     try:
-        with ThreadPoolExecutor(max_workers=concurrency) as pool:
-            pending = {pool.submit(_do_one, index) for index in range(count)}
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_COMPLETED)
-                for future in done:
-                    result = future.result()
+        pending = {pool.submit(_do_one, index): index for index in range(count)}
+        while pending:
+            done, _ = wait(
+                set(pending),
+                timeout=5,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in done:
+                pending.pop(future, None)
+                result = future.result()
+                completed += 1
+                if isinstance(result, dict):
+                    success += 1
+                    registered_accounts.append(result)
+                elif result != "__cancel_requested__":
+                    errors.append(str(result))
+                logger.set_progress(completed, count)
+
+            with activity_lock:
+                timed_out = _find_stalled_registration_workers(
+                    pending,
+                    last_activity,
+                    timeout_seconds=worker_stall_timeout,
+                )
+            if timed_out:
+                for future in timed_out:
+                    worker_index = pending.pop(future)
+                    future.cancel()
+                    timeout_error = (
+                        f"注册 Worker {worker_index + 1} 失去进展超过 "
+                        f"{worker_stall_timeout} 秒，已标记失败"
+                    )
+                    errors.append(timeout_error)
+                    logger.record_error(timeout_error)
                     completed += 1
-                    if isinstance(result, dict):
-                        success += 1
-                        registered_accounts.append(result)
-                    elif result != "__cancel_requested__":
-                        errors.append(str(result))
-                    logger.set_progress(completed, count)
+                logger.log(
+                    f"已结束 {len(timed_out)} 个无进展 Worker，其他 Worker 继续执行",
+                    level="error",
+                )
+                logger.set_progress(completed, count)
     except Exception as exc:
         logger.log(f"致命错误: {exc}", level="error")
         logger.finish(TASK_STATUS_FAILED, error=str(exc))
         return
+    finally:
+        # A browser driver may ignore cancellation after its connection drops.
+        # Do not let that orphaned thread keep the platform task slot occupied.
+        pool.shutdown(wait=False, cancel_futures=True)
 
     logger.set_result_data(
         {
@@ -770,7 +1095,66 @@ def _execute_register_task(payload: dict[str, Any], logger: TaskLogger) -> None:
         logger.finish(TASK_STATUS_CANCELLED, error="任务已取消")
         return
     final_status = TASK_STATUS_FAILED if errors and success == 0 else TASK_STATUS_SUCCEEDED
+    if str(payload.get("source") or "") == "pool_maintenance":
+        _continue_auto_pool_registration(payload, final_status, logger)
     logger.finish(final_status, error=errors[0] if final_status == TASK_STATUS_FAILED else "")
+
+
+def _continue_auto_pool_registration(
+    payload: dict[str, Any],
+    final_status: str,
+    logger: TaskLogger,
+) -> None:
+    from core.config_store import config_store
+
+    enabled = str(config_store.get("chatgpt_pool_maintenance_enabled", "") or "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
+        logger.log("自动补量已关闭，不再续建注册任务")
+        return
+
+    config_store.set_many({
+        "chatgpt_pool_auto_failure_count": "0",
+        "chatgpt_pool_auto_next_allowed_at": "",
+    })
+    try:
+        target = max(int(config_store.get("chatgpt_pool_target", "100") or 100), 1)
+    except (TypeError, ValueError):
+        target = 100
+    try:
+        concurrency = max(int(config_store.get("chatgpt_pool_registration_concurrency", "1") or 1), 1)
+    except (TypeError, ValueError):
+        concurrency = 1
+    pool_size = _count_chatgpt_pool_accounts()
+    if pool_size >= target:
+        logger.log(f"自动补量已达到目标: {pool_size}/{target}")
+        return
+
+    # Keep one fresh registration queued until the configured pool target is
+    # reached. The periodic scan remains a safety net, not the pace setter.
+    batch_size = min(concurrency, target - pool_size)
+    retry_payload = {
+        **payload,
+        "count": batch_size,
+        "concurrency": concurrency,
+        "source": "pool_maintenance",
+    }
+    retry_extra = dict(retry_payload.get("extra") or {})
+    retry_extra["source"] = "pool_maintenance"
+    retry_payload["extra"] = retry_extra
+    retry_task = create_register_task(retry_payload)
+    logger.log(
+        f"自动补量 {pool_size}/{target}，已创建 {batch_size} 个并发注册: {retry_task.get('id', '')}",
+        level="warning",
+    )
+
+
+def _count_chatgpt_pool_accounts() -> int:
+    with Session(engine) as session:
+        return int(
+            session.exec(
+                select(func.count()).select_from(AccountModel).where(AccountModel.platform == "chatgpt")
+            ).one() or 0
+        )
 
 
 def _execute_platform_action_task(payload: dict[str, Any], logger: TaskLogger) -> None:
@@ -846,4 +1230,67 @@ def _execute_account_check_all_task(payload: dict[str, Any], logger: TaskLogger)
         completed += 1
         logger.set_progress(completed, total)
     logger.set_result_data(results)
+    logger.finish(TASK_STATUS_SUCCEEDED)
+
+
+def _execute_pool_maintenance_task(payload: dict[str, Any], logger: TaskLogger) -> None:
+    target = max(int(payload.get("target", 1) or 1), 1)
+    concurrency = max(int(payload.get("concurrency", 1) or 1), 1)
+    account_ids = [int(item) for item in payload.get("account_ids", []) if int(item or 0) > 0]
+    with Session(engine) as session:
+        query = select(AccountModel).where(AccountModel.platform == "chatgpt")
+        if account_ids:
+            query = query.where(AccountModel.id.in_(account_ids))
+        accounts = session.exec(query.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())).all()
+
+    # The lifecycle model monitor owns real gpt-5.5 probing and cleanup.
+    # Pool maintenance must only schedule work from those persisted results;
+    # otherwise a slow per-account probe blocks registration for minutes.
+    with Session(engine) as session:
+        graphs = load_account_graphs(
+            session,
+            [int(account.id or 0) for account in accounts if account.id],
+        )
+    usable = sum(
+        1
+        for account in accounts
+        if graphs.get(int(account.id or 0), {}).get("validity_status") != "invalid"
+    )
+    probe_errors = 0
+    cleanup = {"deleted_local": 0, "deleted_sub2api": 0}
+    logger.log(f"号池状态读取完成: 可用 {usable}/{target}，账号总数 {len(accounts)}")
+    logger.set_progress(len(accounts), len(accounts))
+
+    shortfall = max(target - usable, 0)
+    register_task = None
+    if shortfall:
+        register_task = create_register_task(
+            {
+                "platform": "chatgpt",
+                "count": min(concurrency, shortfall),
+                "concurrency": concurrency,
+                "executor_type": "headless",
+                "source": "pool_maintenance",
+                "captcha_solver": "auto",
+                "extra": {
+                    "identity_provider": "mailbox",
+                    "auto_upload_agent_identity_cpa": True,
+                    "source": "pool_maintenance",
+                },
+            }
+        )
+        logger.log(f"有效账号 {usable}/{target}，已创建 {min(concurrency, shortfall)} 个并发补量任务，剩余缺口 {shortfall}")
+    else:
+        logger.log(f"有效账号 {usable}/{target}，无需补量")
+    logger.set_result_data(
+        {
+            "target": target,
+            "checked": len(accounts),
+            "usable": usable,
+            "shortfall": shortfall,
+            "probe_errors": probe_errors,
+            "cleanup": cleanup,
+            "register_task_id": (register_task or {}).get("id") or (register_task or {}).get("task_id"),
+        }
+    )
     logger.finish(TASK_STATUS_SUCCEEDED)

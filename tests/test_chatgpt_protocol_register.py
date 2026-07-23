@@ -120,6 +120,13 @@ def test_protocol_registration_accepts_current_chatgpt_otp_subjects():
     assert adapter.otp_spec.keyword == ""
 
 
+def test_browser_registration_limits_otp_wait_for_fast_pool_recovery():
+    adapter = ChatGPTPlatform().build_browser_registration_adapter()
+
+    assert adapter.otp_spec is not None
+    assert adapter.otp_spec.timeout == 20
+
+
 def test_sentinel_headers_include_vm_and_session_observer_tokens():
     class _FakeRuntime:
         def vm_tokens(self, chat_req, cached_proof):

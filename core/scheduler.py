@@ -8,6 +8,13 @@ from .base_platform import AccountStatus, RegisterConfig
 from .db import engine, AccountModel
 from .platform_accounts import build_platform_account
 from .registry import get, load_all
+from .config_store import config_store
+from application.tasks import (
+    create_register_task,
+    get_chatgpt_pool_status,
+    has_queued_or_active_chatgpt_work,
+)
+from services.task_runtime import task_runtime
 import threading
 import time
 
@@ -20,6 +27,7 @@ class Scheduler:
     def __init__(self):
         self._running = False
         self._thread: threading.Thread = None
+        self._last_trial_expiry_check = 0.0
 
     def start(self):
         if self._running:
@@ -35,11 +43,63 @@ class Scheduler:
     def _loop(self):
         while self._running:
             try:
-                self.check_trial_expiry()
+                now = time.monotonic()
+                if now - self._last_trial_expiry_check >= 3600:
+                    self.check_trial_expiry()
+                    self._last_trial_expiry_check = now
+                self.check_chatgpt_pool_maintenance()
             except Exception as e:
                 print(f"[Scheduler] 错误: {e}")
-            # 每小时检查一次
-            time.sleep(3600)
+            time.sleep(self._chatgpt_pool_interval_seconds())
+
+    @staticmethod
+    def _chatgpt_pool_interval_seconds() -> int:
+        try:
+            return max(int(config_store.get("chatgpt_pool_interval_seconds", "60") or 60), 60)
+        except (TypeError, ValueError):
+            return 60
+
+    def check_chatgpt_pool_maintenance(self) -> bool:
+        """Create registration work directly from the monitored pool state."""
+        enabled = str(config_store.get("chatgpt_pool_maintenance_enabled", "") or "").strip().lower()
+        if enabled not in {"1", "true", "yes", "on"}:
+            return False
+        try:
+            target = max(int(config_store.get("chatgpt_pool_target", "100") or 100), 1)
+        except (TypeError, ValueError):
+            target = 100
+        try:
+            concurrency = max(int(config_store.get("chatgpt_pool_registration_concurrency", "1") or 1), 1)
+        except (TypeError, ValueError):
+            concurrency = 1
+        if has_queued_or_active_chatgpt_work():
+            return False
+        pool = get_chatgpt_pool_status()
+        shortfall = max(target - int(pool.get("usable") or 0), 0)
+        if not shortfall:
+            return False
+        batch_size = min(concurrency, shortfall)
+        task = create_register_task(
+            {
+                "platform": "chatgpt",
+                "count": batch_size,
+                "concurrency": concurrency,
+                "executor_type": "headless",
+                "captcha_solver": "auto",
+                "source": "pool_maintenance",
+                "extra": {
+                    "identity_provider": "mailbox",
+                    "auto_upload_agent_identity_cpa": True,
+                    "source": "pool_maintenance",
+                },
+            }
+        )
+        task_runtime.wake_up()
+        print(
+            f"[Scheduler] 号池 {pool.get('usable', 0)}/{target}，"
+            f"已创建 {batch_size} 个注册任务: {task.get('id', '')}"
+        )
+        return True
 
     def check_trial_expiry(self):
         """检查 trial 到期账号，更新状态"""

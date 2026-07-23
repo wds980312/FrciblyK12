@@ -48,6 +48,7 @@ export function TaskLogPanel({
   const seenEventIdsRef = useRef<Set<number>>(new Set());
   const cursorRef = useRef(0);
   const doneRef = useRef(false);
+  const completionStartedRef = useRef(false);
   const onDoneRef = useRef(onDone);
   const sseHealthyRef = useRef(false);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -61,13 +62,38 @@ export function TaskLogPanel({
     seenEventIdsRef.current = new Set();
     cursorRef.current = 0;
     doneRef.current = false;
+    completionStartedRef.current = false;
     sseHealthyRef.current = false;
     setEvents([]);
     setTask(null);
     setDoneStatus(null);
     setCollapsed({});
 
-    const pushEvent = (payload: any) => {
+    async function flushEventsAndFinish(status: string) {
+      if (doneRef.current || completionStartedRef.current) return;
+      completionStartedRef.current = true;
+      try {
+        // Task status can become terminal before the SSE loop has emitted its
+        // final batch. Fetch by cursor before closing the stream so no account
+        // result is omitted from the modal.
+        const data = await apiFetch(`/tasks/${taskId}/events?since=${cursorRef.current}`);
+        for (const item of data.items || []) {
+          pushEvent(item);
+        }
+      } catch {
+        // The SSE stream may already have delivered the same events.
+      } finally {
+        if (doneRef.current) return;
+        doneRef.current = true;
+        sseHealthyRef.current = false;
+        eventSourceRef.current?.close();
+        eventSourceRef.current = null;
+        setDoneStatus(status || "succeeded");
+        onDoneRef.current(status || "succeeded");
+      }
+    }
+
+    function pushEvent(payload: any) {
       const eventId = Number(payload?.id || 0);
       if (eventId && seenEventIdsRef.current.has(eventId)) return;
       if (eventId) {
@@ -87,21 +113,15 @@ export function TaskLogPanel({
         ]);
       }
       if (payload?.done && !doneRef.current) {
-        doneRef.current = true;
-        sseHealthyRef.current = false;
-        eventSourceRef.current?.close();
-        eventSourceRef.current = null;
-        const nextStatus = payload.status || "succeeded";
-        setDoneStatus(nextStatus);
-        onDoneRef.current(nextStatus);
+        void flushEventsAndFinish(payload.status || "succeeded");
       }
-    };
+    }
 
     const syncTask = async () => {
       const latest = await apiFetch(`/tasks/${taskId}`);
       setTask(latest);
       if (isTerminalTaskStatus(latest.status) && !doneRef.current) {
-        pushEvent({ done: true, status: latest.status });
+        void flushEventsAndFinish(latest.status);
       }
     };
 

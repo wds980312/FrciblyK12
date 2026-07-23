@@ -19,8 +19,6 @@ RETRYABLE_ERROR_MARKERS = (
     "SSLEOFError",
     "Connection aborted",
 )
-
-
 def _truthy(value: object) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on", "y"}
 
@@ -61,6 +59,14 @@ class YYDSMailbox(BaseMailbox):
         self.request_timeout = max(1.0, float(15 if request_timeout in (None, "") else request_timeout))
         self.proxy = {"http": proxy, "https": proxy} if proxy else None
         self.session = session or self._new_session()
+        self._activity_callback = None
+
+    def set_activity_callback(self, callback) -> None:
+        self._activity_callback = callback
+
+    def _touch_activity(self) -> None:
+        if self._activity_callback is not None:
+            self._activity_callback()
 
     @staticmethod
     def _new_session():
@@ -103,6 +109,7 @@ class YYDSMailbox(BaseMailbox):
     def _request(self, method: str, url: str, **kwargs):
         last_exc: Exception | None = None
         for attempt in range(3):
+            self._touch_activity()
             try:
                 request = getattr(self.session, method)
                 return request(url, **kwargs)
@@ -236,6 +243,7 @@ class YYDSMailbox(BaseMailbox):
         seen = set(before_ids or set())
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self._touch_activity()
             for item in self._list_messages(account):
                 message_id = str(item.get("id") or "").strip()
                 if not message_id or message_id in seen:

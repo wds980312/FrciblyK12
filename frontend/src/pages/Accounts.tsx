@@ -1491,6 +1491,7 @@ export default function Accounts() {
 
   const [accounts, setAccounts] = useState<any[]>([])
   const [total, setTotal] = useState(0)
+  const [page, setPage] = useState(1)
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [debouncedSearch, setDebouncedSearch] = useState('')
@@ -1502,6 +1503,7 @@ export default function Accounts() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set())
   const [actionResult, setActionResult] = useState<{ title: string; payload: any } | null>(null)
   const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [cleanupInvalidLoading, setCleanupInvalidLoading] = useState(false)
   const [batchRefreshing, setBatchRefreshing] = useState(false)
   const [batchTask, setBatchTask] = useState<{ taskId: string; title: string } | null>(null)
   const [batchTaskStatus, setBatchTaskStatus] = useState<string | null>(null)
@@ -1521,20 +1523,21 @@ export default function Accounts() {
 
   useEffect(() => {
     setSelectedIds(new Set())
+    setPage(1)
   }, [tab, filterStatus, debouncedSearch])
 
-  const load = useCallback(async (p = tab, s = debouncedSearch, fs = filterStatus) => {
+  const load = useCallback(async (p = tab, s = debouncedSearch, fs = filterStatus, currentPage = page) => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ platform: p, page: '1', page_size: '100' })
+      const params = new URLSearchParams({ platform: p, page: String(currentPage), page_size: '20' })
       if (s) params.set('email', s)
       if (fs) params.set('status', fs)
       const data = await apiFetch(`/accounts?${params}`)
       setAccounts(data.items); setTotal(data.total)
     } finally { setLoading(false) }
-  }, [tab, debouncedSearch, filterStatus])
+  }, [tab, debouncedSearch, filterStatus, page])
 
-  useEffect(() => { load(tab, debouncedSearch, filterStatus) }, [tab, debouncedSearch, filterStatus])
+  useEffect(() => { load(tab, debouncedSearch, filterStatus, page) }, [tab, debouncedSearch, filterStatus, page])
 
   useEffect(() => {
     setSelectedIds(prev => {
@@ -1596,6 +1599,49 @@ export default function Accounts() {
   const visibleSubscribed = accounts.filter(acc => getPlanState(acc) === 'subscribed').length
   const visibleInvalid = accounts.filter(acc => getValidityStatus(acc) === 'invalid' || getLifecycleStatus(acc) === 'invalid').length
   const linkedCashier = accounts.filter(acc => Boolean(getCashierUrl(acc))).length
+  const totalPages = Math.max(1, Math.ceil(total / 20))
+
+  const cleanupInvalidAccounts = async () => {
+    setCleanupInvalidLoading(true)
+    try {
+      const preview = await apiFetch('/accounts/cleanup-invalid/preview', {
+        method: 'POST',
+        body: JSON.stringify({ include_sub2api: true }),
+      })
+      if (!preview?.local_count) {
+        alert(t('accounts.cleanupInvalidEmpty'))
+        return
+      }
+      if (Array.isArray(preview.sub2api_errors) && preview.sub2api_errors.length > 0) {
+        alert(preview.sub2api_errors.map((item: any) => item?.message || String(item)).join('\n'))
+        return
+      }
+      const sample = Array.isArray(preview.accounts)
+        ? preview.accounts.slice(0, 5).map((item: any) => item.email).join('\n')
+        : ''
+      const more = preview.local_count > 5 ? `\n... +${preview.local_count - 5}` : ''
+      const message = t('accounts.cleanupInvalidConfirm', {
+        local: preview.local_count,
+        sub2: preview.sub2api_count || 0,
+      }) + (sample ? `\n\n${sample}${more}` : '')
+      if (!confirm(message)) return
+      const result = await apiFetch('/accounts/cleanup-invalid', {
+        method: 'POST',
+        body: JSON.stringify({ include_sub2api: true }),
+      })
+      setSelectedIds(new Set())
+      const sub2apiErrors = Array.isArray(result?.sub2api_errors) ? result.sub2api_errors : []
+      const localErrors = Array.isArray(result?.local_errors) ? result.local_errors : []
+      if (sub2apiErrors.length || localErrors.length) {
+        alert([...sub2apiErrors, ...localErrors].map((item: any) => item?.message || String(item)).join('\n'))
+      }
+      load()
+    } catch (error: any) {
+      alert(error?.message || String(error))
+    } finally {
+      setCleanupInvalidLoading(false)
+    }
+  }
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-4 overflow-hidden">
@@ -1722,6 +1768,18 @@ export default function Accounts() {
             <Button variant="ghost" size="sm" onClick={() => load()} disabled={loading} className="h-7 w-7 p-0 text-[var(--text-muted)] hover:text-[var(--text-primary)]">
               <RefreshCw className={`h-3.5 w-3.5 ${loading ? 'animate-spin' : ''}`} />
             </Button>
+            {tab === 'chatgpt' && visibleInvalid > 0 && (
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={cleanupInvalidLoading || loading}
+                className="h-7 px-2.5 text-red-500 hover:bg-red-500/10 hover:text-red-600"
+                onClick={cleanupInvalidAccounts}
+              >
+                <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                {cleanupInvalidLoading ? t('accounts.cleanupInvalidRunning') : t('accounts.cleanupInvalid')}
+              </Button>
+            )}
             {selectedCount > 0 && (
               <Button
                 size="sm"
@@ -1923,6 +1981,13 @@ export default function Accounts() {
         </table>
           </div>
         </div>
+        {totalPages > 1 && (
+          <div className="flex items-center justify-end gap-2 border-t border-[var(--border)] px-4 py-3 text-xs text-[var(--text-muted)]">
+            <span>{page} / {totalPages}</span>
+            <Button variant="outline" size="sm" disabled={page <= 1 || loading} onClick={() => setPage(value => Math.max(1, value - 1))}>上一页</Button>
+            <Button variant="outline" size="sm" disabled={page >= totalPages || loading} onClick={() => setPage(value => Math.min(totalPages, value + 1))}>下一页</Button>
+          </div>
+        )}
       </Card>
     </div>
   )

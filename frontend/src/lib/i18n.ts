@@ -254,6 +254,12 @@ const ZH_MESSAGES = {
   "accounts.refreshingCredits": "刷新中...",
   "accounts.refreshCreditsTitle": "一键刷新全部账号额度",
   "accounts.refreshAllCreditsTask": "刷新全部 {platform} 账号额度",
+  "accounts.cleanupInvalid": "清理失效",
+  "accounts.cleanupInvalidRunning": "清理中...",
+  "accounts.cleanupInvalidEmpty": "当前没有失效账号需要清理。",
+  "accounts.cleanupInvalidConfirm":
+    "将删除本地失效账号 {local} 个，并删除 Sub2API 匹配记录 {sub2} 条。确认继续？",
+  "accounts.cleanupInvalidResult": "清理失效账号结果",
   "accounts.deleteSelectedConfirm":
     "确认删除选中的 {count} 个账号？此操作不可撤销。",
   "accounts.link": "试用链接",
@@ -287,9 +293,9 @@ const ZH_MESSAGES = {
   "accounts.protocolVerificationSummary": "内置 Sentinel + Outlook 邮箱 OTP",
   "accounts.autoDownloadAgentIdentity": "注册成功后自动上传 Agent Identity",
   "accounts.autoDownloadAgentIdentityHint":
-    "本次成功账号会生成与手动导出相同的 Sub2API Agent Identity JSON，并直接上传到 CPA/Sub2。",
+    "本次成功账号会生成与手动导出相同的 Sub2API Agent Identity JSON，并直接导入 Sub2API。",
   "accounts.agentIdentityExporting": "正在确认 Agent Identity 上传结果…",
-  "accounts.agentIdentityExported": "Agent Identity 已上传到 CPA/Sub2",
+  "accounts.agentIdentityExported": "Agent Identity 已导入 Sub2API",
   "accounts.agentIdentityExportFailed": "Agent Identity 上传失败",
   "accounts.agentIdentityNoSuccessfulAccounts": "任务中没有可导出的成功账号",
   "accounts.agentIdentityUploadNoResult": "任务没有返回 Agent Identity 上传结果",
@@ -650,6 +656,12 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.refreshingCredits": "Refreshing...",
   "accounts.refreshCreditsTitle": "Refresh credits for all accounts",
   "accounts.refreshAllCreditsTask": "Refresh all {platform} account credits",
+  "accounts.cleanupInvalid": "Clean Invalid",
+  "accounts.cleanupInvalidRunning": "Cleaning...",
+  "accounts.cleanupInvalidEmpty": "There are no invalid accounts to clean.",
+  "accounts.cleanupInvalidConfirm":
+    "This will delete {local} invalid local accounts and {sub2} matching Sub2API records. Continue?",
+  "accounts.cleanupInvalidResult": "Invalid Account Cleanup Result",
   "accounts.deleteSelectedConfirm":
     "Delete {count} selected accounts? This cannot be undone.",
   "accounts.link": "Trial Link",
@@ -683,9 +695,9 @@ const EN_MESSAGES: Record<TranslationKey, string> = {
   "accounts.protocolVerificationSummary": "Built-in Sentinel + Outlook email OTP",
   "accounts.autoDownloadAgentIdentity": "Upload Agent Identity after registration",
   "accounts.autoDownloadAgentIdentityHint":
-    "Successful accounts are converted to the same Sub2API Agent Identity JSON as manual export, then uploaded to CPA/Sub2.",
+    "Successful accounts are converted to the same Sub2API Agent Identity JSON as manual export, then imported into Sub2API.",
   "accounts.agentIdentityExporting": "Checking Agent Identity upload results…",
-  "accounts.agentIdentityExported": "Agent Identity uploaded to CPA/Sub2",
+  "accounts.agentIdentityExported": "Agent Identity imported into Sub2API",
   "accounts.agentIdentityExportFailed": "Agent Identity upload failed",
   "accounts.agentIdentityNoSuccessfulAccounts": "This task has no successful accounts to export",
   "accounts.agentIdentityUploadNoResult": "The task did not return Agent Identity upload results",

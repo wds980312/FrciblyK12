@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from concurrent.futures import Future
+import time
+
+from sqlmodel import Session
+
 from application import tasks as tasks_module
 from core.base_platform import Account
+from core.db import TaskModel, engine
 from domain.actions import ActionExecutionResult
 from domain.actions import ActionExecutionCommand
 from infrastructure import platform_runtime as runtime_module
@@ -40,6 +46,137 @@ class _FakeLogger:
 
     def finish(self, status, *, error=""):
         self.finished = (status, error)
+
+
+def test_wait_for_registration_workers_marks_stalled_futures_as_timed_out(monkeypatch):
+    completed = Future()
+    completed.set_result({"account_id": 1, "email": "ok@example.com"})
+    stalled = Future()
+
+    calls = []
+
+    def fake_wait(pending, *, timeout, return_when):
+        calls.append((set(pending), timeout, return_when))
+        return {completed}, {stalled}
+
+    done, timed_out = tasks_module._wait_for_registration_workers(
+        {completed, stalled},
+        timeout_seconds=120,
+        wait_fn=fake_wait,
+    )
+
+    assert done == {completed}
+    assert timed_out == set()
+    assert calls[0][1] == 120
+
+
+def test_wait_for_registration_workers_returns_stalled_futures_after_timeout(monkeypatch):
+    stalled = Future()
+
+    def fake_wait(pending, *, timeout, return_when):
+        return set(), set(pending)
+
+    done, timed_out = tasks_module._wait_for_registration_workers(
+        {stalled},
+        timeout_seconds=120,
+        wait_fn=fake_wait,
+    )
+
+    assert done == set()
+    assert timed_out == {stalled}
+
+
+def test_registration_worker_stall_detection_is_per_worker():
+    fresh = Future()
+    stale = Future()
+    now = time.monotonic()
+
+    stalled = tasks_module._find_stalled_registration_workers(
+        {fresh: 1, stale: 2},
+        {1: now - 5, 2: now - 91},
+        timeout_seconds=90,
+        now=now,
+    )
+
+    assert stalled == {stale}
+
+
+def test_chatgpt_register_workers_build_distinct_mailboxes(monkeypatch):
+    mailboxes = []
+    seen_mailboxes = []
+
+    class FakePlatform:
+        def __init__(self, mailbox):
+            self.mailbox = mailbox
+
+        def register(self, email=None, password=None):
+            seen_mailboxes.append(self.mailbox)
+            return Account(
+                platform="chatgpt",
+                email=f"registered-{len(seen_mailboxes)}@example.com",
+                password="Secret123!",
+                user_id="acct_123",
+                extra={"access_token": "access-token"},
+            )
+
+    monkeypatch.setattr(tasks_module, "get", lambda _platform_name: object)
+    monkeypatch.setattr(
+        tasks_module,
+        "_resolve_registration_proxy_for_platform",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "_build_platform_instance",
+        lambda _platform, _payload, _logger, **kwargs: FakePlatform(kwargs["shared_mailbox"]),
+    )
+    monkeypatch.setattr(
+        "core.base_mailbox.create_mailbox",
+        lambda *args, **kwargs: mailboxes.append(object()) or mailboxes[-1],
+    )
+    monkeypatch.setattr(
+        tasks_module,
+        "save_account",
+        lambda account: type("SavedAccount", (), {"id": len(seen_mailboxes)})(),
+    )
+
+    logger = _FakeLogger()
+    tasks_module._execute_register_task(
+        {
+            "platform": "chatgpt",
+            "count": 2,
+            "concurrency": 2,
+            "extra": {"identity_provider": "mailbox", "mail_provider": "yyds_mail_api"},
+        },
+        logger,
+    )
+
+    assert len(mailboxes) == 2
+    assert len({id(mailbox) for mailbox in seen_mailboxes}) == 2
+
+
+def test_service_restart_keeps_pending_tasks_queued():
+    pending = tasks_module.create_task(
+        task_type="platform_action",
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 1, "action_id": "query_state"},
+    )
+    running = tasks_module.create_task(
+        task_type="platform_action",
+        platform="chatgpt",
+        payload={"platform": "chatgpt", "account_id": 2, "action_id": "query_state"},
+    )
+    with Session(engine) as session:
+        running_model = session.get(TaskModel, running["id"])
+        running_model.status = tasks_module.TASK_STATUS_RUNNING
+        session.add(running_model)
+        session.commit()
+
+    tasks_module.mark_incomplete_tasks_interrupted()
+
+    with Session(engine) as session:
+        assert session.get(TaskModel, pending["id"]).status == tasks_module.TASK_STATUS_PENDING
+        assert session.get(TaskModel, running["id"]).status == tasks_module.TASK_STATUS_INTERRUPTED
 
 
 def test_platform_action_task_passes_task_logger_to_runtime(monkeypatch):
@@ -103,6 +240,17 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
         "save_account",
         lambda account: type("SavedAccount", (), {"id": 123})(),
     )
+    monkeypatch.setattr(
+        tasks_module,
+        "_upload_registered_agent_identity",
+        lambda account_id: {
+            "account_id": account_id,
+            "ok": True,
+            "message": "Sub2API 数据导入成功",
+            "filename": "registered.json",
+            "target": "sub2api",
+        },
+    )
     monkeypatch.setattr("core.base_mailbox.create_mailbox", lambda *args, **kwargs: object())
 
     logger = _FakeLogger()
@@ -128,13 +276,30 @@ def test_chatgpt_register_task_succeeds_after_successful_registration(monkeypatc
         "fail": 0,
         "account_ids": [123],
         "accounts": [
-            {
-                "account_id": 123,
-                "email": "registered@example.com",
-            }
-        ],
-        "auto_download_agent_identity": True,
-    }
+                {
+                    "account_id": 123,
+                    "email": "registered@example.com",
+                    "agent_identity_upload": {
+                        "account_id": 123,
+                        "ok": True,
+                        "message": "Sub2API 数据导入成功",
+                        "filename": "registered.json",
+                        "target": "sub2api",
+                    },
+                }
+            ],
+            "auto_download_agent_identity": True,
+            "auto_upload_agent_identity_cpa": True,
+            "agent_identity_uploads": [
+                {
+                    "account_id": 123,
+                    "ok": True,
+                    "message": "Sub2API 数据导入成功",
+                    "filename": "registered.json",
+                    "target": "sub2api",
+                }
+            ],
+        }
     assert any(event[0] == "success" for event in logger.events)
     assert not any(
         "cannot access local variable 'extra'" in str(event)

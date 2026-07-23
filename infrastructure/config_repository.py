@@ -9,7 +9,11 @@ class ConfigRepository:
         "default_executor",
         "default_identity_provider",
         "cpa_api_url", "cpa_api_key",
+        "sub2api_api_url", "sub2api_auth_token", "sub2api_api_key", "sub2api_default_group",
         "team_manager_url", "team_manager_key",
+        "chatgpt_pool_maintenance_enabled", "chatgpt_pool_target",
+        "chatgpt_pool_interval_seconds", "chatgpt_pool_registration_concurrency",
+        "chatgpt_pool_auto_failure_count", "chatgpt_pool_auto_next_allowed_at",
     }
 
     def __init__(self, definitions: ProviderDefinitionsRepository | None = None):

@@ -42,6 +42,7 @@ class ChatGPTPlatform(BasePlatform):
         "query_state",      # Query account state/quota
         "switch_desktop",   # Switch to Codex desktop
         "upload_cpa",       # Upload to CPA system
+        "upload_agent_identity_cpa",  # Import Agent Identity into Sub2API
         "upload_tm",        # Upload to Team Manager
     ]
 
@@ -168,7 +169,7 @@ class ChatGPTPlatform(BasePlatform):
                 email=ctx.identity.email or "",
                 password=ctx.password or "",
             ),
-            otp_spec=OtpSpec(wait_message="等待验证码...", timeout=600),
+            otp_spec=OtpSpec(wait_message="等待验证码...", timeout=20),
         )
 
     def build_protocol_mailbox_adapter(self):
@@ -209,10 +210,10 @@ class ChatGPTPlatform(BasePlatform):
         return [
             {"id": "switch_account", "label": "切换到 Codex 桌面端", "params": []},
             {"id": "get_account_state", "label": "查询账号状态/订阅", "params": []},
-            {"id": "upload_agent_identity_cpa", "label": "上传 Agent Identity",
+            {"id": "upload_agent_identity_cpa", "label": "导入 Agent Identity 到 Sub2API",
              "params": [
-                 {"key": "api_url", "label": "CPA API URL", "type": "text"},
-                 {"key": "api_key", "label": "CPA API Key", "type": "text"},
+                 {"key": "api_url", "label": "Sub2API API URL", "type": "text"},
+                 {"key": "api_key", "label": "Sub2API Auth Token", "type": "text"},
              ]},
             {"id": "upload_cpa", "label": "上传 CPA",
              "params": [
@@ -306,18 +307,17 @@ class ChatGPTPlatform(BasePlatform):
 
         if action_id == "upload_agent_identity_cpa":
             from application.account_exports import make_agent_identity_sub2api_json_from_tokens
-            from platforms.chatgpt.cpa_upload import upload_agent_identity_to_cpa
+            from platforms.chatgpt.sub2api_upload import upload_agent_identity_to_sub2api
 
             export_data = make_agent_identity_sub2api_json_from_tokens(
                 email=a.email,
                 access_token=a.access_token,
                 id_token=a.id_token,
             )
-            ok, msg = upload_agent_identity_to_cpa(
+            ok, msg = upload_agent_identity_to_sub2api(
                 export_data,
-                filename=f"{a.email}_agent_identity_sub2api.json",
                 api_url=params.get("api_url"),
-                api_key=params.get("api_key"),
+                auth_token=params.get("api_key"),
             )
             return {"ok": ok, "data": msg}
 

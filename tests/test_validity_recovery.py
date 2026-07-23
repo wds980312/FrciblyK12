@@ -56,6 +56,10 @@ def _overview(account_id: int):
 def test_single_account_check_recovers_previously_invalid_account(monkeypatch):
     account_id = _create_account(lifecycle_status="invalid")
     monkeypatch.setattr("application.tasks.get", lambda _platform: _AlwaysValidPlatform)
+    monkeypatch.setattr(
+        "application.tasks.probe_sub2api_account_model",
+        lambda *args, **kwargs: {"status": "success", "message": "gpt-5.5 返回了模型响应"},
+    )
 
     valid, result = _run_single_account_check(account_id)
 
@@ -162,3 +166,55 @@ def test_chatgpt_check_valid_uses_proxy_pool_before_direct(monkeypatch):
     assert calls == ["http://127.0.0.1:7890"]
     assert proxy_events == [("success", "http://127.0.0.1:7890")]
     assert plugin.get_last_check_overview()["chatgpt_usage"] == {"plan_type": "free"}
+
+
+def test_chatgpt_model_probe_marks_account_invalid_after_one_failure(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+
+    class _ProbePlatform:
+        def __init__(self, config=None):
+            self.config = config
+
+        def check_valid(self, account):
+            return True
+
+        def get_last_check_overview(self):
+            return {"plan_state": "free", "plan": "free"}
+
+    monkeypatch.setattr("application.tasks.get", lambda _platform: _ProbePlatform)
+    monkeypatch.setattr(
+        "application.tasks.probe_sub2api_account_model",
+        lambda *args, **kwargs: {"status": "failed", "message": "gpt-5.5 unavailable"},
+    )
+
+    assert _run_single_account_check(account_id)[0] is False
+
+    overview = _overview(account_id)
+    assert overview.validity_status == "invalid"
+    assert overview.get_summary()["model_probe_failure_count"] == 1
+
+
+def test_chatgpt_model_probe_network_error_does_not_mark_account_invalid(monkeypatch):
+    account_id = _create_account(lifecycle_status="registered")
+
+    class _ProbePlatform:
+        def __init__(self, config=None):
+            self.config = config
+
+        def check_valid(self, account):
+            return True
+
+        def get_last_check_overview(self):
+            return {}
+
+    monkeypatch.setattr("application.tasks.get", lambda _platform: _ProbePlatform)
+    monkeypatch.setattr(
+        "application.tasks.probe_sub2api_account_model",
+        lambda *args, **kwargs: {"status": "error", "message": "connection reset"},
+    )
+
+    assert _run_single_account_check(account_id)[0] is True
+
+    overview = _overview(account_id)
+    assert overview.validity_status == "valid"
+    assert overview.get_summary()["model_probe_status"] == "error"

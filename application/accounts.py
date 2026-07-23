@@ -14,6 +14,11 @@ from domain.accounts import (
     AccountUpdateCommand,
 )
 from infrastructure.accounts_repository import AccountsRepository
+from platforms.chatgpt.sub2api_upload import (
+    delete_sub2api_account,
+    find_sub2api_accounts_by_emails,
+    get_sub2api_config_error,
+)
 
 
 IMPORT_LINE_RE = re.compile(
@@ -60,6 +65,71 @@ class AccountsService:
 
     def delete_account(self, account_id: int) -> dict:
         return {"ok": self.repository.delete(account_id)}
+
+    def preview_cleanup_invalid_chatgpt(self, *, include_sub2api: bool = True) -> dict:
+        accounts = self.repository.list_invalid(platform="chatgpt")
+        sub2api_matches = {}
+        sub2api_errors: list[dict] = []
+        if include_sub2api and accounts:
+            config_error = get_sub2api_config_error()
+            if config_error:
+                sub2api_errors.append({"message": config_error})
+            else:
+                sub2api_matches = find_sub2api_accounts_by_emails([item.email for item in accounts])
+        return {
+            "platform": "chatgpt",
+            "local_count": len(accounts),
+            "sub2api_count": sum(len(items) for items in sub2api_matches.values()),
+            "accounts": [
+                {"id": item.id, "email": item.email}
+                for item in accounts
+            ],
+            "sub2api_matches": sub2api_matches,
+            "sub2api_errors": sub2api_errors,
+        }
+
+    def cleanup_invalid_chatgpt(self, *, include_sub2api: bool = True) -> dict:
+        preview = self.preview_cleanup_invalid_chatgpt(include_sub2api=include_sub2api)
+        deleted_sub2api = 0
+        sub2api_errors: list[dict] = list(preview.get("sub2api_errors") or [])
+        if include_sub2api and sub2api_errors:
+            return {
+                **preview,
+                "deleted_local": 0,
+                "deleted_sub2api": 0,
+                "local_errors": [],
+                "sub2api_errors": sub2api_errors,
+            }
+        if include_sub2api:
+            for email, matches in preview.get("sub2api_matches", {}).items():
+                for match in matches:
+                    remote_id = match.get("id") or match.get("account_id") or match.get("uuid")
+                    ok, message = delete_sub2api_account(remote_id)
+                    if ok:
+                        deleted_sub2api += 1
+                    else:
+                        sub2api_errors.append({
+                            "email": email,
+                            "id": remote_id,
+                            "message": message,
+                        })
+
+        deleted_local = 0
+        local_errors: list[dict] = []
+        for account in preview["accounts"]:
+            account_id = int(account["id"])
+            if self.repository.delete(account_id):
+                deleted_local += 1
+            else:
+                local_errors.append(account)
+
+        return {
+            **preview,
+            "deleted_local": deleted_local,
+            "deleted_sub2api": deleted_sub2api,
+            "local_errors": local_errors,
+            "sub2api_errors": sub2api_errors,
+        }
 
     def import_accounts(self, platform: str, lines: list[str]) -> dict:
         parsed: list[AccountImportLine] = []

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+from sqlalchemy import func, or_
 from sqlmodel import Session, select
 
 from core.account_display import build_account_display_summary
-from core.db import AccountModel, engine
+from core.db import AccountModel, AccountOverviewModel, engine
 from core.account_graph import (
     compute_account_stats,
     load_account_graphs,
@@ -104,29 +105,69 @@ class AccountsRepository:
             graphs = load_account_graphs(session, account_ids)
         return [_to_record(model, graphs.get(int(model.id or 0), {})) for model in models]
 
+    @staticmethod
+    def _apply_list_filters(statement, query: AccountQuery):
+        if query.platform:
+            statement = statement.where(AccountModel.platform == query.platform)
+        if query.email:
+            statement = statement.where(AccountModel.email.contains(query.email))
+        if not query.status:
+            return statement
+
+        # Overview status columns are maintained with the account graph. Query
+        # them here so list pages only hydrate the records they display.
+        statement = statement.outerjoin(
+            AccountOverviewModel,
+            AccountOverviewModel.account_id == AccountModel.id,
+        )
+        status = query.status
+        conditions = [
+            AccountOverviewModel.display_status == status,
+            AccountOverviewModel.lifecycle_status == status,
+            AccountOverviewModel.plan_state == status,
+            AccountOverviewModel.validity_status == status,
+        ]
+        # A legacy account without a graph serializes as registered / unknown.
+        if status in {"registered", "unknown"}:
+            conditions.append(AccountOverviewModel.account_id.is_(None))
+        return statement.where(or_(*conditions))
+
     def list(self, query: AccountQuery) -> tuple[int, list[AccountRecord]]:
         page = max(query.page, 1)
         page_size = max(query.page_size, 1)
         with Session(engine) as session:
+            statement = self._apply_list_filters(select(AccountModel), query)
+            count_statement = self._apply_list_filters(
+                select(func.count()).select_from(AccountModel),
+                query,
+            )
+            total = int(session.exec(count_statement).one() or 0)
+            models = session.exec(
+                statement
+                .order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            ).all()
+            records = self._load_records(session, models)
+        return total, records
+
+    def list_invalid(self, platform: str = "") -> list[AccountRecord]:
+        with Session(engine) as session:
             statement = select(AccountModel)
-            if query.platform:
-                statement = statement.where(AccountModel.platform == query.platform)
-            if query.email:
-                statement = statement.where(AccountModel.email.contains(query.email))
+            if platform:
+                statement = statement.where(AccountModel.platform == platform)
             statement = statement.order_by(AccountModel.created_at.desc(), AccountModel.id.desc())
             models = session.exec(statement).all()
             records = self._load_records(session, models)
-            if query.status:
-                records = [item for item in records if matches_status_filter({
-                    "display_status": item.display_status,
-                    "lifecycle_status": item.lifecycle_status,
-                    "plan_state": item.plan_state,
-                    "validity_status": item.validity_status,
-                }, query.status)]
-        total = len(records)
-        start = (page - 1) * page_size
-        end = start + page_size
-        return total, records[start:end]
+        return [
+            item for item in records
+            if "invalid" in {
+                item.display_status,
+                item.lifecycle_status,
+                item.plan_state,
+                item.validity_status,
+            }
+        ]
 
     def get(self, account_id: int) -> AccountRecord | None:
         with Session(engine) as session:

@@ -2546,7 +2546,9 @@ def _browser_registration_flow(page, email: str, password: str, otp_callback, lo
             raise RuntimeError(f"注册状态卡住: page={state.get('page_type') or '-'}")
 
         if _is_registration_complete(state):
-            _handle_post_signup_onboarding(page, log)
+            # The OAuth redirect already reached ChatGPT. Optional onboarding
+            # clicks can block on a just-disconnected browser driver and keep
+            # us from extracting the authenticated session below.
             return _extract_flow_state(None, page.url)
 
         if _is_password_registration(state):
